@@ -1,0 +1,198 @@
+[
+  {
+    "timestamp": "2026-06-03T16:57:05.451009",
+    "phone": "+919284078848",
+    "bot": "Riya (Investment)",
+    "bot_type": "riya",
+    "agent_id": "test-agent-123",
+    "call_id": "test-call-123",
+    "duration_seconds": 120,
+    "estimated_cost_inr": 22.5,
+    "lead_score": 8,
+    "lead_status": "HOT",
+    "interest_level": "interested",
+    "customer_name": "Vedant",
+    "conversation_summary": "Customer wants mutual funds.",
+    "manager_action": "PENDING",
+    "call_status": "completed"
+  },
+  {
+    "phone": "+919284078848",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T17:01:31.200938",
+    "status": "initiated",
+    "agent_id": "1e64a371-7961-4c10-9ab2-4003ca5ebfb4",
+    "call_id": ""
+  },
+  {
+    "timestamp": "2026-06-03T17:01:46.019049",
+    "phone": "+919284078848",
+    "bot": "Riya (Investment)",
+    "bot_type": "riya",
+    "agent_id": "1e64a371-7961-4c10-9ab2-4003ca5ebfb4",
+    "call_id": "call-12345",
+    "duration_seconds": 145,
+    "estimated_cost_inr": 26.87,
+    "lead_score": 8,
+    "lead_status": "HOT",
+    "interest_level": "interested",
+    "customer_name": "Unknown",
+    "conversation_summary": "Customer is very interested in starting a SIP for mutual funds.",
+    "manager_action": "PENDING",
+    "call_status": "completed"
+  },
+  {
+    "phone": "+919284078848",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T17:02:18.905111",
+    "status": "initiated",
+    "agent_id": "342592fd-222f-4c70-8646-77792d93bc8b",
+    "call_id": ""
+  },
+  {
+    "phone": "+919022873952",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T17:43:00.839252",
+    "status": "initiated",
+    "agent_id": "59fb0c23-4910-453e-9d5f-b836b55f6270",
+    "call_id": ""
+  },
+  {
+    "phone": "+919028362706",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T18:57:11.729879",
+    "status": "error",
+    "agent_id": "c1abe2fc-3e02-44af-8a21-de4c2fb8b4f9",
+    "message": "Call failed: 400 — {\"message\":\"Trial accounts can only make calls to verified phone numbers.\"}"
+  },
+  {
+    "phone": "+919028362706",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T18:59:11.584287",
+    "status": "initiated",
+    "agent_id": "4488a715-e81b-4579-96c2-f8bb54ace6cf",
+    "call_id": ""
+  },
+  {
+    "phone": "+919028362706",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T19:00:11.308733",
+    "status": "initiated",
+    "agent_id": "ef1aad29-df7d-4ab7-8f32-30496f139e5c",
+    "call_id": ""
+  },
+  {
+    "phone": "+919028362706",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T19:09:00.176583",
+    "status": "initiated",
+    "agent_id": "4fa62849-9a35-49e1-b81a-21c9af5c6742",
+    "call_id": ""
+  },
+  {
+    "phone": "+919284078848",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T19:10:54.683988",
+    "status": "initiated",
+    "agent_id": "74d81891-6cd0-451c-912c-8d4c7a1a1fc2",
+    "call_id": ""
+  },
+  {
+    "phone": "+919370079820",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T19:18:32.927927",
+    "status": "initiated",
+    "agent_id": "54c0b10d-bf27-4866-a993-73ffdd16221e",
+    "call_id": ""
+  },
+  {
+    "phone": "+919370079820",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T19:21:32.315460",
+    "status": "initiated",
+    "agent_id": "6bd33fe1-ec9d-4ae9-bed8-63aa646e7d62",
+    "call_id": ""
+  },
+  {
+    "phone": "+919370079820",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T20:03:03.347385",
+    "status": "initiated",
+    "agent_id": "f6088da2-4cac-43d1-ac8c-bb14162648a3",
+    "call_id": ""
+  },
+  {
+    "phone": "+919370079820",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T20:21:15.883941",
+    "status": "initiated",
+    "agent_id": "5858ecab-3b06-4d9d-92ca-6eb4cc8b6977",
+    "call_id": ""
+  },
+  {
+    "phone": "+919370079820",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T20:27:31.530088",
+    "status": "initiated",
+    "agent_id": "f47c1e99-a5d3-4f42-8435-a2ce41ae7a15",
+    "call_id": ""
+  },
+  {
+    "phone": "+919370079820",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T20:28:27.064556",
+    "status": "initiated",
+    "agent_id": "acdef0ac-4e13-4583-a69c-dc292db69501",
+    "call_id": ""
+  },
+  {
+    "phone": "+919370079820",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T20:31:12.985056",
+    "status": "initiated",
+    "agent_id": "185b997e-0182-458c-a7f0-81a39851b124",
+    "call_id": ""
+  },
+  {
+    "phone": "+919370079820",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T23:01:17.664144",
+    "status": "initiated",
+    "agent_id": "c2321532-6b26-47da-af44-68a1dd7940ee",
+    "call_id": ""
+  },
+  {
+    "phone": "+919370079820",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T23:09:09.216378",
+    "status": "error",
+    "agent_id": "91529ad5-cb67-4668-acdc-6e234e036ccf",
+    "message": "Call failed: 404 — {\"message\":\"Wallet balance is low. Please recharge to proceed.\"}"
+  },
+  {
+    "phone": "+919370079820",
+    "bot": "Riya - Investment Advisor",
+    "bot_type": "riya",
+    "timestamp": "2026-06-03T23:14:12.959215",
+    "status": "error",
+    "agent_id": "f7f59ea0-f465-446d-a8c7-dad2319704df",
+    "message": "Call failed: 400 — {\"message\":\"Trial accounts can only make calls to verified phone numbers.\"}"
+  }
+]

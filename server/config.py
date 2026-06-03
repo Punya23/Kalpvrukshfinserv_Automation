@@ -21,9 +21,33 @@ class Config:
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
-    # --- Voice AI (Vapi) ---
+    # --- Voice AI (Vapi.ai) ---
     VAPI_API_KEY: str = os.getenv("VAPI_API_KEY", "")
     VAPI_PHONE_NUMBER_ID: str = os.getenv("VAPI_PHONE_NUMBER_ID", "")
+
+    # --- Bolna AI (Voice Calls) ---
+    BOLNA_API_KEY: str = os.getenv("BOLNA_API_KEY", "")
+    BOLNA_BASE_URL: str = "https://api.bolna.ai"
+
+    # --- Sarvam AI (Hindi Voice) ---
+    SARVAM_API_KEY: str = os.getenv("SARVAM_API_KEY", "")
+
+    # --- Phase 3 Voice Pipeline (Self-Hosted) ---
+    AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID", "")
+    AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+    TWILIO_ACCOUNT_SID: str = os.getenv("TWILIO_ACCOUNT_SID", "")
+    TWILIO_AUTH_TOKEN: str = os.getenv("TWILIO_AUTH_TOKEN", "")
+    TWILIO_PHONE_NUMBER: str = os.getenv("TWILIO_PHONE_NUMBER", "")
+    DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
+
+    # --- Voice Call Cost Estimates (INR per minute) ---
+    COST_BOLNA_TELEPHONY: float = 2.0    # Bolna platform + Twilio telephony
+    COST_ELEVENLABS_TTS: float = 8.0     # ElevenLabs Turbo v2.5
+    COST_SARVAM_TTS: float = 1.5         # Sarvam Bulbul v3
+    COST_DEEPGRAM_STT: float = 0.5       # Deepgram Nova-2
+    COST_OPENAI_LLM: float = 1.5         # GPT-4o-mini per call (flat estimate)
+    COST_GROQ_LLM: float = 0.0           # Groq is free
 
     # --- Google Sheets ---
     GOOGLE_SHEETS_CREDENTIALS_FILE: str = os.getenv(

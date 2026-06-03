@@ -3,13 +3,14 @@ Kalpvruksh Finserv AI Automation — Main Server
 FastAPI application with webhook routes for WhatsApp, Voice AI, and testing.
 """
 
+import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from typing import Optional
 
@@ -22,6 +23,9 @@ from server.bots.investment_bot import investment_bot
 from server.bots.reminder_bot import reminder_bot
 from server.scheduler import renewal_scheduler
 from server.lead_scoring import LeadSource
+from server import call_manager
+from server.voice_pipeline import VoiceConnectionManager
+from twilio.rest import Client
 
 # -------------------------------------------------------
 # Logging Setup
@@ -32,6 +36,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("kalpvruksh")
+
+# Suppress noisy library logs
+logging.getLogger("botocore").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 # -------------------------------------------------------
@@ -116,6 +124,12 @@ class ChatResponse(BaseModel):
     intent: Optional[str] = None
     confidence: Optional[float] = None
     bot_used: str
+
+
+class MakeCallRequest(BaseModel):
+    """Request model for the make-call endpoint."""
+    phone: str  # e.g. "9022873952" or "+919022873952"
+    bot_type: str = "riya"  # "riya" (investment) or "aarav" (insurance)
 
 
 class RenewalSummaryResponse(BaseModel):
@@ -282,16 +296,12 @@ async def vapi_webhook(request: Request):
     event_type = body.get("message", {}).get("type", body.get("type", ""))
 
     if event_type == "function-call":
-        # Handle Vapi function calls
         function_name = body.get("message", {}).get("functionCall", {}).get("name", "")
         parameters = body.get("message", {}).get("functionCall", {}).get("parameters", {})
         logger.info(f"Vapi function call: {function_name}({parameters})")
-
-        # Route to appropriate handler
         return JSONResponse({"result": "Function processed"})
 
     elif event_type == "transcript":
-        # Process transcript
         transcript = body.get("message", {}).get("transcript", "")
         logger.info(f"Vapi transcript: {transcript[:100]}...")
         return JSONResponse({"status": "received"})
@@ -301,6 +311,143 @@ async def vapi_webhook(request: Request):
         return JSONResponse({"status": "noted"})
 
     return JSONResponse({"status": "ok"})
+
+
+# -------------------------------------------------------
+# Bolna AI Voice Call Endpoints
+# -------------------------------------------------------
+
+@app.post("/webhook/bolna")
+async def bolna_webhook(request: Request):
+    """
+    Bolna AI call completion webhook.
+    Receives call data when a voice call ends.
+    Processes lead data, scores it, and logs to Google Sheets / local storage.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    logger.info(f"Bolna webhook received: {json.dumps(body)[:200]}...")
+    record = call_manager.process_bolna_webhook(body)
+
+    return JSONResponse({
+        "status": "processed",
+        "lead_status": record.get("lead_status"),
+        "lead_score": record.get("lead_score"),
+        "estimated_cost": record.get("estimated_cost_inr"),
+    })
+
+
+@app.post("/api/make-call")
+async def make_call(request: MakeCallRequest):
+    """
+    Trigger a new voice call via Bolna AI.
+
+    Body:
+        phone: str — phone number (e.g. "9022873952")
+        bot_type: str — "riya" (investment) or "aarav" (insurance)
+    """
+    result = await call_manager.create_agent_and_call(
+        phone=request.phone,
+        bot_type=request.bot_type,
+    )
+    status_code = 200 if result.get("status") != "error" else 400
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.get("/api/system-status")
+async def system_status():
+    """
+    Full system status: all APIs, models, providers, costs, and call stats.
+    This is the main dashboard endpoint.
+    """
+    return call_manager.get_system_status()
+
+
+@app.get("/api/call-history")
+async def api_call_history():
+    """List all voice call records with costs and lead data."""
+    records = call_manager.get_call_history()
+    return {
+        "total": len(records),
+        "calls": records,
+    }
+
+
+# -------------------------------------------------------
+# Twilio Voice AI Pipeline (Phase 3)
+# -------------------------------------------------------
+
+@app.post("/twilio/incoming-call")
+async def twilio_incoming_call(request: Request):
+    """
+    Twilio webhook for incoming calls. 
+    Returns TwiML that connects the call to our WebSocket.
+    """
+    host = request.headers.get("host", config.SERVER_HOST)
+    # Ensure wss:// in production, ws:// for local testing
+    ws_url = f"wss://{host}/twilio/stream" if "localhost" not in host and "127.0.0.1" not in host else f"ws://{host}/twilio/stream"
+    
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{ws_url}" />
+    </Connect>
+</Response>"""
+    return Response(content=twiml, media_type="text/xml")
+
+
+@app.websocket("/twilio/stream")
+async def twilio_stream(websocket: WebSocket):
+    """
+    WebSocket endpoint that receives raw audio from Twilio Media Streams,
+    and bridges it to Deepgram, Groq, and AWS Polly.
+    """
+    await websocket.accept()
+    logger.info("Twilio WebSocket connected.")
+    
+    manager = VoiceConnectionManager(websocket)
+    
+    try:
+        while True:
+            message = await websocket.receive_text()
+            await manager.handle_twilio_message(message)
+    except WebSocketDisconnect:
+        logger.info("Twilio WebSocket connection closed normally.")
+    except Exception as e:
+        logger.error(f"Twilio WebSocket error: {e}")
+
+
+@app.post("/api/make-call-twilio")
+async def make_call_twilio(request: MakeCallRequest):
+    """
+    Trigger an outbound call using Twilio REST API.
+    The call connects to the /twilio/incoming-call webhook.
+    """
+    if not config.TWILIO_ACCOUNT_SID or not config.TWILIO_AUTH_TOKEN:
+        return JSONResponse({"status": "error", "message": "Twilio credentials missing."}, status_code=400)
+        
+    client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
+    
+    host = "locator-controlling-blvd-theme.trycloudflare.com" # cloudflare tunnel domain
+    
+    try:
+        call = client.calls.create(
+            url=f"https://{host}/twilio/incoming-call",
+            to=request.phone,
+            from_=getattr(config, "TWILIO_PHONE_NUMBER", "+1234567890") # Use config or placeholder
+        )
+        return {"status": "initiated", "call_sid": call.sid}
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.get("/api/cost-summary")
+async def api_cost_summary():
+    """Cost breakdown: total spend, per-call averages, by bot."""
+    return call_manager.get_cost_summary()
 
 
 @app.get("/renewals/summary")

@@ -19,7 +19,7 @@ BOLNA_API_KEY = os.getenv("BOLNA_API_KEY", "")
 BOLNA_BASE_URL = "https://api.bolna.ai"
 
 # Changed to 9022873952
-CUSTOMER_PHONE = "+919022873952"
+CUSTOMER_PHONE = "+919284078848"
 
 # Load investment prompt
 PROMPT_FILE = os.path.join(os.path.dirname(__file__), "prompts", "investment_bot_prompt.txt")
@@ -46,10 +46,7 @@ def create_agent_and_call():
         "agent_config": {
             "agent_name": "Riya - Kalpvruksh Investment Bot",
             "agent_type": "other",
-            "agent_welcome_message": (
-                "Hi! This is Riya from Kalpvruksh Finserv, Pune. "
-                "Am I speaking with the right person?"
-            ),
+            "agent_welcome_message": "Hi, namaste! Main Riya bol rahi hoon Kalpvruksh Finserv se. Kya aapse do minute baat ho sakti hai?",
             "tasks": [
                 {
                     "task_type": "conversation",
@@ -65,8 +62,8 @@ def create_agent_and_call():
                                 "provider": "openai",
                                 "family": "openai",
                                 "model": "gpt-4o-mini",
-                                "max_tokens": 500,
-                                "temperature": 0.7,
+                                "max_tokens": 150,
+                                "temperature": 0.5,
                                 "agent_flow_type": "streaming",
                             },
                         },
@@ -78,11 +75,11 @@ def create_agent_and_call():
                             "endpointing": 250,
                         },
                         "synthesizer": {
-                            "provider": "elevenlabs",
+                            "provider": "sarvam",
                             "provider_config": {
-                                "voice": "Apsara \u2013 Raw & Natural Hinglish Agent",
-                                "voice_id": "QpSjVAs2VI5btKzupPaD",
-                                "model": "eleven_turbo_v2_5"
+                                "voice": "priya",
+                                "model": "bulbul:v3",
+                                "language": "hi-IN"
                             },
                             "stream": True,
                             "buffer_size": 100,
@@ -98,13 +95,13 @@ def create_agent_and_call():
                         },
                     },
                     "task_config": {
-                        "hangup_after_silence": 15,
-                        "incremental_delay": 200,
+                        "hangup_after_silence": 20,
+                        "incremental_delay": 100,
                         "number_of_words_for_interruption": 1,
                         "call_terminate": 180,
                         "backchanneling": True,
-                        "backchanneling_message_gap": 4,
-                        "backchanneling_start_delay": 3,
+                        "backchanneling_message_gap": 5,
+                        "backchanneling_start_delay": 4,
                     },
                 }
             ],
@@ -122,8 +119,8 @@ def create_agent_and_call():
     print(f"  Target:  {CUSTOMER_PHONE}")
     print(f"  Bot:     Riya (Investment Advisor)")
     print(f"  Ears:    Deepgram (Nova-2, Hindi)")
-    print(f"  Brain:   OpenAI (GPT-4o-mini)")
-    print(f"  Voice:   ElevenLabs (Apsara - Natural Hinglish)")
+    print(f"  Brain:   Groq (Llama 3.3 70B)")
+    print(f"  Voice:   AWS Polly (Kajal - Hindi Female)")
     print("=" * 60)
     print()
 
