@@ -1,0 +1,65 @@
+{
+  "sheet_name": "Kalpvruksh Finserv — AI Lead Tracker",
+  "tabs": [
+    {
+      "name": "Hot Leads",
+      "description": "Leads scored 7+ by the AI bots — require immediate manager callback",
+      "columns": [
+        {"name": "Timestamp", "type": "datetime", "description": "When the lead was captured"},
+        {"name": "Name", "type": "text", "description": "Customer full name"},
+        {"name": "Phone", "type": "phone", "description": "Customer phone number"},
+        {"name": "Age", "type": "number", "description": "Customer age"},
+        {"name": "Occupation", "type": "text", "description": "Job/business type"},
+        {"name": "Family Members", "type": "number", "description": "Total family members"},
+        {"name": "Currently Insured", "type": "dropdown", "options": ["Yes", "No"], "description": "Has existing insurance?"},
+        {"name": "Interest", "type": "text", "description": "health/life/SIP/MF/tax-saving"},
+        {"name": "Budget/Surplus", "type": "text", "description": "Annual budget or monthly investable surplus"},
+        {"name": "Lead Score", "type": "number", "description": "AI-generated score 0-10"},
+        {"name": "Category", "type": "dropdown", "options": ["HOT", "WARM", "COLD", "DNC"], "description": "Lead category"},
+        {"name": "Bot", "type": "dropdown", "options": ["Insurance", "Investment", "Reminder"], "description": "Which bot captured this lead"},
+        {"name": "Source", "type": "dropdown", "options": ["inbound_whatsapp", "inbound_call", "outbound_call", "website_form", "referral", "social_media"], "description": "Lead source"},
+        {"name": "Conversation Summary", "type": "long_text", "description": "AI-generated 2-3 line summary"},
+        {"name": "Manager Action", "type": "dropdown", "options": ["PENDING CALLBACK", "CALLED", "PROPOSAL SENT", "CONVERTED", "NOT INTERESTED"], "description": "Manager's follow-up status"},
+        {"name": "Status", "type": "dropdown", "options": ["NEW", "IN PROGRESS", "CONVERTED", "LOST", "NURTURE"], "description": "Overall lead status"}
+      ]
+    },
+    {
+      "name": "Nurture Pipeline",
+      "description": "Warm leads (score 4-6) for follow-up drip campaigns",
+      "columns": [
+        {"name": "Timestamp", "type": "datetime"},
+        {"name": "Name", "type": "text"},
+        {"name": "Phone", "type": "phone"},
+        {"name": "Interest", "type": "text"},
+        {"name": "Score", "type": "number"},
+        {"name": "Bot", "type": "text"},
+        {"name": "Next Follow-up", "type": "text", "description": "7/14/21/30 days"},
+        {"name": "Notes", "type": "long_text"},
+        {"name": "Status", "type": "dropdown", "options": ["NURTURING", "UPGRADED TO HOT", "CONVERTED", "DEAD"]}
+      ]
+    },
+    {
+      "name": "Renewals Tracker",
+      "description": "Insurance policy renewal tracking with reminder status",
+      "columns": [
+        {"name": "Customer ID", "type": "text", "description": "KF-XXXX format"},
+        {"name": "Name", "type": "text"},
+        {"name": "Phone", "type": "phone"},
+        {"name": "Policy Number", "type": "text"},
+        {"name": "Insurer", "type": "text"},
+        {"name": "Plan", "type": "text"},
+        {"name": "Sum Insured", "type": "number"},
+        {"name": "Premium", "type": "number"},
+        {"name": "Expiry Date", "type": "date"},
+        {"name": "Days Until Expiry", "type": "number", "description": "Auto-calculated"},
+        {"name": "D-60 Reminder Sent", "type": "checkbox"},
+        {"name": "D-30 Reminder Sent", "type": "checkbox"},
+        {"name": "D-15 Reminder Sent", "type": "checkbox"},
+        {"name": "D-7 Reminder Sent", "type": "checkbox"},
+        {"name": "D-1 Reminder Sent", "type": "checkbox"},
+        {"name": "Renewal Status", "type": "dropdown", "options": ["PENDING", "RENEWED", "LAPSED", "CANCELLED"]},
+        {"name": "Notes", "type": "long_text"}
+      ]
+    }
+  ]
+}

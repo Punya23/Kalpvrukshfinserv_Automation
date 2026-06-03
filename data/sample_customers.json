@@ -1,0 +1,178 @@
+[
+  {
+    "id": "KF-001",
+    "name": "Rajesh Sharma",
+    "phone": "919876543001",
+    "email": "rajesh.sharma@email.com",
+    "age": 42,
+    "occupation": "IT Manager",
+    "annual_income": "₹18L",
+    "city": "Pune",
+    "family": {
+      "spouse": {"name": "Neha Sharma", "age": 38},
+      "children": [
+        {"name": "Arjun", "age": 14},
+        {"name": "Ananya", "age": 10}
+      ]
+    },
+    "risk_profile": "Moderate",
+    "client_since": "2022-07-01",
+    "source": "Referral",
+    "policies": [
+      {
+        "type": "Health Insurance",
+        "insurer": "Star Health",
+        "plan": "Family Health Optima",
+        "policy_number": "SH-HI-2024-001",
+        "sum_insured": 1000000,
+        "premium": 22000,
+        "start_date": "2024-07-01",
+        "expiry_date": "2026-07-01",
+        "status": "Active",
+        "ncb_years": 2
+      }
+    ],
+    "investments": [
+      {
+        "type": "SIP",
+        "fund_name": "HDFC Flexi Cap Fund - Growth",
+        "amc": "HDFC AMC",
+        "folio": "1234567/89",
+        "sip_amount": 5000,
+        "sip_date": 5,
+        "start_date": "2023-01-15",
+        "total_invested": 90000,
+        "current_value": 108000,
+        "absolute_return": 20.0,
+        "xirr": 16.5,
+        "status": "Active"
+      },
+      {
+        "type": "SIP",
+        "fund_name": "ICICI Pru Balanced Advantage Fund",
+        "amc": "ICICI Pru AMC",
+        "folio": "9876543/21",
+        "sip_amount": 3000,
+        "sip_date": 10,
+        "start_date": "2023-06-01",
+        "total_invested": 36000,
+        "current_value": 40500,
+        "absolute_return": 12.5,
+        "xirr": 11.8,
+        "status": "Active"
+      }
+    ],
+    "loans": [],
+    "cross_sell_opportunities": ["Term Insurance (no life cover)", "ELSS for tax saving"]
+  },
+  {
+    "id": "KF-002",
+    "name": "Priya Deshmukh",
+    "phone": "919876543002",
+    "email": "priya.deshmukh@email.com",
+    "age": 65,
+    "occupation": "Retired Teacher",
+    "annual_income": "₹4L (Pension)",
+    "city": "Pune",
+    "family": {
+      "spouse": {"name": "Suresh Deshmukh", "age": 68},
+      "children": []
+    },
+    "risk_profile": "Conservative",
+    "client_since": "2021-06-15",
+    "source": "Society Presentation",
+    "policies": [
+      {
+        "type": "Health Insurance",
+        "insurer": "Star Health",
+        "plan": "Senior Citizens Red Carpet",
+        "policy_number": "SH-HI-2024-002",
+        "sum_insured": 500000,
+        "premium": 35000,
+        "start_date": "2024-06-15",
+        "expiry_date": "2026-06-15",
+        "status": "Active",
+        "ncb_years": 3
+      }
+    ],
+    "investments": [],
+    "loans": [],
+    "cross_sell_opportunities": ["Super Surplus Top-Up (enhance coverage)", "Debt Mutual Fund for pension optimization"]
+  },
+  {
+    "id": "KF-003",
+    "name": "Amit Kulkarni",
+    "phone": "919876543003",
+    "email": "amit.kulkarni@email.com",
+    "age": 35,
+    "occupation": "Business Owner - Hardware Store",
+    "annual_income": "₹25L",
+    "city": "Pune",
+    "family": {
+      "spouse": {"name": "Sneha Kulkarni", "age": 32},
+      "children": [
+        {"name": "Vivaan", "age": 5}
+      ]
+    },
+    "risk_profile": "Moderate Aggressive",
+    "client_since": "2022-03-15",
+    "source": "Referral from KF-001",
+    "policies": [
+      {
+        "type": "Health Insurance",
+        "insurer": "Star Health",
+        "plan": "Star Comprehensive",
+        "policy_number": "SH-HI-2024-003",
+        "sum_insured": 2500000,
+        "premium": 48000,
+        "start_date": "2024-06-08",
+        "expiry_date": "2026-06-08",
+        "status": "Active",
+        "ncb_years": 1
+      },
+      {
+        "type": "Term Insurance",
+        "insurer": "Max Life",
+        "plan": "Smart Secure Plus",
+        "policy_number": "ML-TI-2023-001",
+        "sum_insured": 10000000,
+        "premium": 12500,
+        "start_date": "2023-03-15",
+        "expiry_date": "2053-03-15",
+        "status": "Active"
+      }
+    ],
+    "investments": [
+      {
+        "type": "SIP",
+        "fund_name": "SBI Small Cap Fund - Growth",
+        "amc": "SBI AMC",
+        "folio": "5555666/77",
+        "sip_amount": 10000,
+        "sip_date": 1,
+        "start_date": "2022-04-01",
+        "total_invested": 500000,
+        "current_value": 685000,
+        "absolute_return": 37.0,
+        "xirr": 22.3,
+        "status": "Active"
+      },
+      {
+        "type": "SIP",
+        "fund_name": "Axis ELSS Tax Saver Fund",
+        "amc": "Axis AMC",
+        "folio": "8888999/00",
+        "sip_amount": 5000,
+        "sip_date": 1,
+        "start_date": "2023-01-01",
+        "total_invested": 90000,
+        "current_value": 102000,
+        "absolute_return": 13.3,
+        "xirr": 14.1,
+        "status": "Active"
+      }
+    ],
+    "loans": [],
+    "cross_sell_opportunities": ["Home Insurance (business owner)", "Child Education SIP (son is 5)"]
+  }
+]
