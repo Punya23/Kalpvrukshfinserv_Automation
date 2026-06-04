@@ -4,7 +4,7 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-dotenv==1.1.0
-pydantic==2.11.1
+pydantic==2.13.4
 
 # --- LLM Providers ---
 groq==0.25.0
@@ -23,9 +23,16 @@ requests==2.32.3
 # --- Scheduling ---
 apscheduler==3.11.0
 
+# --- Voice AI (Twilio / Custom) ---
+websockets>=11.0.3
+boto3>=1.34.0
+twilio>=9.0.0
+
 # --- Voice AI (Vapi) ---
 # vapi-python (install separately if using Vapi SDK)
 
 # --- Utilities ---
 python-dateutil==2.9.0
 pandas==2.3.0
+beautifulsoup4==4.12.3
+playwright==1.49.0

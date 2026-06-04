@@ -61,14 +61,14 @@ VOICE_PROFILES = {
 
 # Current active stack info
 ACTIVE_STACK = {
-    "orchestrator": "Bolna AI",
-    "llm_provider": "OpenAI",
-    "llm_model": "gpt-4o-mini",
+    "orchestrator": "Self-hosted (FastAPI + WebSocket)",
+    "llm_provider": "Groq",
+    "llm_model": "llama-3.3-70b-versatile",
     "stt_provider": "Deepgram",
-    "stt_model": "Nova-2",
+    "stt_model": "Nova-2 (Hindi)",
     "tts_provider": "AWS Polly",
-    "tts_model": "Neural (Kajal/Aditi)",
-    "telephony": "Bolna (Twilio-backed)",
+    "tts_model": "Neural (Kajal hi-IN)",
+    "telephony": "Exotel (India SIP)",
 }
 
 
@@ -148,16 +148,33 @@ def get_cost_summary() -> dict:
     }
 
 
-def estimate_call_cost(duration_seconds: int, tts_provider: str = "elevenlabs") -> float:
-    """Estimate cost of a call based on duration and providers used."""
+def estimate_call_cost(duration_seconds: int, stack: str = "exotel") -> float:
+    """Estimate cost of a call based on duration and providers used.
+    
+    Exotel stack (current production):
+    - Telephony: ₹0.80/min (Exotel)
+    - STT: ₹0.36/min (Deepgram Nova-2)
+    - LLM: ₹0.00/min (Groq free tier)
+    - TTS: ₹1.07/min (AWS Polly Neural)
+    Total: ~₹2.23/min = ~₹7.80 per 3.5 min call
+    """
     minutes = duration_seconds / 60.0
-    tts_cost = config.COST_ELEVENLABS_TTS if tts_provider == "elevenlabs" else config.COST_SARVAM_TTS
-    cost = (
-        (config.COST_BOLNA_TELEPHONY * minutes)
-        + (tts_cost * minutes)
-        + (config.COST_DEEPGRAM_STT * minutes)
-        + config.COST_OPENAI_LLM  # flat per-call
-    )
+    if stack == "exotel":
+        cost = (
+            (0.80 * minutes)   # Exotel telephony
+            + (0.36 * minutes) # Deepgram STT
+            + (0.00)           # Groq LLM (free)
+            + (1.07 * minutes) # AWS Polly TTS
+        )
+    else:
+        # Legacy Bolna stack
+        tts_cost = config.COST_ELEVENLABS_TTS
+        cost = (
+            (config.COST_BOLNA_TELEPHONY * minutes)
+            + (tts_cost * minutes)
+            + (config.COST_DEEPGRAM_STT * minutes)
+            + config.COST_OPENAI_LLM
+        )
     return round(cost, 2)
 
 

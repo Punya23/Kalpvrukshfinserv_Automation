@@ -96,13 +96,14 @@ class SheetsManager:
         filepath.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
         logger.info(f"Written to local fallback: {filepath}")
 
-    def log_hot_lead(self, lead: LeadData) -> bool:
+    def log_hot_lead(self, lead: LeadData, scheduled_day: str = None, scheduled_time: str = None) -> bool:
         """
         Log a hot lead to the 'Hot Leads' sheet.
         Schema: Timestamp | Name | Phone | Age | Occupation | Family Size |
                 Currently Insured | Interest | Budget | Score | Category |
-                Bot | Source | Summary | Manager Action | Status
+                Bot | Source | Summary | Scheduled Callback | Manager Action | Status
         """
+        callback_str = f"{scheduled_day} {scheduled_time}".strip() if scheduled_day else "N/A"
         row_data = {
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Name": lead.name,
@@ -118,6 +119,7 @@ class SheetsManager:
             "Bot": lead.bot_type.value.title(),
             "Source": lead.source.value,
             "Conversation Summary": lead.conversation_summary[:500],
+            "Scheduled Callback": callback_str,
             "Manager Action": "PENDING CALLBACK",
             "Status": "NEW",
         }
@@ -233,15 +235,20 @@ class WhatsAppNotifier:
     def __init__(self):
         self._client = httpx.AsyncClient(timeout=30.0)
 
-    async def notify_manager_hot_lead(self, lead: LeadData) -> bool:
+    async def notify_manager_hot_lead(self, lead: LeadData, scheduled_day: str = None, scheduled_time: str = None) -> bool:
         """Send WhatsApp alert to Sanjeev sir about a hot lead."""
+        callback_line = ""
+        if scheduled_day:
+            callback_line = f"\n⏰ *Requested Callback:* {scheduled_day} {scheduled_time or ''}".strip()
+
         message = (
             f"🔴 *NEW HOT LEAD — {lead.bot_type.value.upper()}*\n\n"
             f"👤 *Name:* {lead.name}\n"
             f"📞 *Phone:* {lead.phone}\n"
             f"🎯 *Score:* {lead.score}/10\n"
             f"📋 *Interest:* {lead.insurance_interest or lead.financial_goal}\n"
-            f"💬 *Summary:* {lead.conversation_summary[:200]}\n\n"
+            f"💬 *Summary:* {lead.conversation_summary[:200]}"
+            f"{callback_line}\n\n"
             f"⚡ *Action Required:* Call back within 1 hour"
         )
 
@@ -268,7 +275,7 @@ class WhatsAppNotifier:
                                      policy_details: dict) -> bool:
         """Send renewal reminder to customer via WhatsApp."""
         message = (
-            f"Namaste {customer_name} ji! 🙏\n\n"
+            f"Namaste {customer_name}! 🙏\n\n"
             f"Kalpvruksh Finserv se Vikram bol raha hoon.\n\n"
             f"Aapki *{policy_details['Plan']}* policy "
             f"(No: {policy_details['Policy Number']}) ka renewal "

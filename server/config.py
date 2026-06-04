@@ -41,6 +41,14 @@ class Config:
     TWILIO_PHONE_NUMBER: str = os.getenv("TWILIO_PHONE_NUMBER", "")
     DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
 
+    # --- Exotel (India Telephony) ---
+    EXOTEL_API_KEY: str = os.getenv("EXOTEL_API_KEY", "")
+    EXOTEL_API_TOKEN: str = os.getenv("EXOTEL_API_TOKEN", "")
+    EXOTEL_ACCOUNT_SID: str = os.getenv("EXOTEL_ACCOUNT_SID", "")
+    EXOTEL_CALLER_ID: str = os.getenv("EXOTEL_CALLER_ID", "")
+    EXOTEL_APP_ID: str = os.getenv("EXOTEL_APP_ID", "")
+    EXOTEL_SUBDOMAIN: str = os.getenv("EXOTEL_SUBDOMAIN", "api.exotel.com")
+
     # --- Voice Call Cost Estimates (INR per minute) ---
     COST_BOLNA_TELEPHONY: float = 2.0    # Bolna platform + Twilio telephony
     COST_ELEVENLABS_TTS: float = 8.0     # ElevenLabs Turbo v2.5

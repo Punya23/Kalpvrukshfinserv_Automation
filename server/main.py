@@ -5,6 +5,7 @@ FastAPI application with webhook routes for WhatsApp, Voice AI, and testing.
 
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 
@@ -24,8 +25,9 @@ from server.bots.reminder_bot import reminder_bot
 from server.scheduler import renewal_scheduler
 from server.lead_scoring import LeadSource
 from server import call_manager
-from server.voice_pipeline import VoiceConnectionManager
+from server.voice_pipeline import VoiceConnectionManager, ExotelVoiceConnectionManager
 from twilio.rest import Client
+import requests
 
 # -------------------------------------------------------
 # Logging Setup
@@ -40,6 +42,8 @@ logger = logging.getLogger("kalpvruksh")
 # Suppress noisy library logs
 logging.getLogger("botocore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("websockets.client").setLevel(logging.WARNING)
 
 
 # -------------------------------------------------------
@@ -130,6 +134,7 @@ class MakeCallRequest(BaseModel):
     """Request model for the make-call endpoint."""
     phone: str  # e.g. "9022873952" or "+919022873952"
     bot_type: str = "riya"  # "riya" (investment) or "aarav" (insurance)
+    customer_name: Optional[str] = None  # Pass name for personalized calls
 
 
 class RenewalSummaryResponse(BaseModel):
@@ -386,7 +391,8 @@ async def twilio_incoming_call(request: Request):
     Twilio webhook for incoming calls. 
     Returns TwiML that connects the call to our WebSocket.
     """
-    host = request.headers.get("host", config.SERVER_HOST)
+    # Use TUNNEL_HOST env var or fall back to the request's Host header
+    host = os.getenv("TUNNEL_HOST", request.headers.get("host", "localhost:8000"))
     # Ensure wss:// in production, ws:// for local testing
     ws_url = f"wss://{host}/twilio/stream" if "localhost" not in host and "127.0.0.1" not in host else f"ws://{host}/twilio/stream"
     
@@ -412,8 +418,19 @@ async def twilio_stream(websocket: WebSocket):
     
     try:
         while True:
-            message = await websocket.receive_text()
-            await manager.handle_twilio_message(message)
+            data = await websocket.receive()
+            if data["type"] == "websocket.disconnect":
+                logger.info("Twilio WebSocket connection closed normally.")
+                break
+            
+            message = None
+            if "text" in data:
+                message = data["text"]
+            elif "bytes" in data:
+                message = data["bytes"].decode("utf-8")
+                
+            if message:
+                await manager.handle_twilio_message(message)
     except WebSocketDisconnect:
         logger.info("Twilio WebSocket connection closed normally.")
     except Exception as e:
@@ -421,7 +438,7 @@ async def twilio_stream(websocket: WebSocket):
 
 
 @app.post("/api/make-call-twilio")
-async def make_call_twilio(request: MakeCallRequest):
+async def make_call_twilio(payload: MakeCallRequest, request: Request):
     """
     Trigger an outbound call using Twilio REST API.
     The call connects to the /twilio/incoming-call webhook.
@@ -431,12 +448,16 @@ async def make_call_twilio(request: MakeCallRequest):
         
     client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
     
-    host = "locator-controlling-blvd-theme.trycloudflare.com" # cloudflare tunnel domain
+    # Use TUNNEL_HOST env var or fall back to the request's Host header
+    host = os.getenv("TUNNEL_HOST", request.headers.get("host", "localhost:8000"))
     
     try:
+        # Build the webhook URL dynamically based on current tunnel
+        webhook_url = f"https://{host}/twilio/incoming-call" if "localhost" not in host and "127.0.0.1" not in host else f"http://{host}/twilio/incoming-call"
+        
         call = client.calls.create(
-            url=f"https://{host}/twilio/incoming-call",
-            to=request.phone,
+            url=webhook_url,
+            to=payload.phone,
             from_=getattr(config, "TWILIO_PHONE_NUMBER", "+1234567890") # Use config or placeholder
         )
         return {"status": "initiated", "call_sid": call.sid}
@@ -498,6 +519,103 @@ async def health_check():
             },
         },
     }
+
+
+# -------------------------------------------------------
+# Exotel Voice AI Pipeline
+# -------------------------------------------------------
+
+@app.websocket("/exotel/stream")
+async def exotel_stream(websocket: WebSocket):
+    """
+    WebSocket endpoint that receives raw PCM audio from Exotel Voicebot Applet,
+    and bridges it to Deepgram, Groq, and AWS Polly.
+    """
+    await websocket.accept()
+    logger.info("[Exotel] WebSocket connected.")
+
+    manager = ExotelVoiceConnectionManager(websocket)
+
+    try:
+        while True:
+            data = await websocket.receive()
+            if data["type"] == "websocket.disconnect":
+                logger.info("[Exotel] WebSocket connection closed normally.")
+                break
+                
+            message = None
+            if "text" in data:
+                message = data["text"]
+            elif "bytes" in data:
+                try:
+                    message = data["bytes"].decode("utf-8")
+                except UnicodeDecodeError:
+                    logger.warning("[Exotel] Received binary audio data directly without JSON wrapper")
+                    continue
+                    
+            if message:
+                await manager.handle_exotel_message(message)
+    except WebSocketDisconnect:
+        logger.info("[Exotel] WebSocket connection closed normally.")
+    except Exception as e:
+        logger.error(f"[Exotel] WebSocket error: {e}")
+
+
+@app.post("/api/make-call-exotel")
+async def make_call_exotel(payload: MakeCallRequest):
+    """
+    Trigger an outbound call using Exotel REST API.
+    The call connects to the Voicebot Applet flow which streams audio
+    to our /exotel/stream WebSocket endpoint.
+
+    Body:
+        phone: str — phone number (e.g. "+919022873952" or "9022873952")
+        bot_type: str — "riya" (default)
+    """
+    if not config.EXOTEL_API_KEY or not config.EXOTEL_API_TOKEN:
+        return JSONResponse(
+            {"status": "error", "message": "Exotel credentials missing."},
+            status_code=400
+        )
+
+    # Normalize phone number
+    phone = payload.phone.strip()
+    if not phone.startswith("+"):
+        if not phone.startswith("91"):
+            phone = f"91{phone}"
+        phone = f"+{phone}"
+
+    # Exotel REST API with Basic Auth in URL
+    url = (
+        f"https://{config.EXOTEL_API_KEY}:{config.EXOTEL_API_TOKEN}"
+        f"@{config.EXOTEL_SUBDOMAIN}/v1/Accounts/{config.EXOTEL_ACCOUNT_SID}"
+        f"/Calls/connect.json"
+    )
+
+    form_data = {
+        "From": phone,
+        "CallerId": config.EXOTEL_CALLER_ID,
+        "Url": f"http://my.exotel.com/{config.EXOTEL_ACCOUNT_SID}/exoml/start_voice/{config.EXOTEL_APP_ID}",
+        "CallType": "trans",
+    }
+
+    try:
+        response = requests.post(url, data=form_data, timeout=30)
+        logger.info(f"[Exotel] Call API response ({response.status_code}): {response.text[:300]}")
+
+        if response.status_code == 200:
+            return {"status": "initiated", "exotel_response": response.json()}
+        else:
+            return JSONResponse(
+                {"status": "error", "message": response.text[:500]},
+                status_code=response.status_code
+            )
+    except Exception as e:
+        logger.error(f"[Exotel] Call API error: {e}")
+        return JSONResponse(
+            {"status": "error", "message": str(e)},
+            status_code=500
+        )
 
 
 # -------------------------------------------------------

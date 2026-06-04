@@ -3,3 +3,7 @@
 __pycache__/
 *.pyc
 voices_output.json
+
+data/
+*.mp3
+*.wav

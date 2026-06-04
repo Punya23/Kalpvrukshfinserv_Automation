@@ -92,7 +92,7 @@ class RenewalScheduler:
 
         # Urgent WhatsApp to customer
         overdue_message = (
-            f"🔴 *URGENT* — {customer_name} ji!\n\n"
+            f"🔴 *URGENT* — {customer_name}!\n\n"
             f"Aapki {renewal.get('Plan', 'health insurance')} policy "
             f"{days_overdue} din pehle expire ho chuki hai.\n\n"
             f"⚠️ Grace period mein hain — abhi renew karna zaroori hai warna:\n"
