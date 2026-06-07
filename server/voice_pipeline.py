@@ -96,6 +96,7 @@ class VoiceConnectionManager:
             customer_name=customer_name, 
             customer_category=customer_category
         )
+        self.crm_context = {"profession": "", "city": "Pune"}
         logger.info(f"Active Persona State Machine | Voice: {self.agent_voice} | Target Client: {customer_name} | Category: {customer_category}")
 
     async def connect_to_deepgram(self):
@@ -158,7 +159,11 @@ class VoiceConnectionManager:
                             cooldown_elapsed = now - self.last_speak_finished_time
                             
                             if self.is_bot_speaking:
-                                # Barge-in: if user speaks during welcome, interrupt it
+                                if getattr(self, 'state_machine', None) and self.state_machine.state == CallState.HANGUP:
+                                    logger.info(f"Ignoring barge-in '{clean_transcript}' because call is in final goodbye.")
+                                    continue
+                                
+                                # Barge-in: if user speaks during welcome/bot, interrupt it
                                 self.welcome_interrupted = True
                                 self.barge_in_transcript = clean_transcript
                                 logger.info(f"User barged in with '{clean_transcript}' — interrupting bot.")
@@ -186,6 +191,8 @@ class VoiceConnectionManager:
 
     async def process_llm_and_speak(self, user_text: str):
         """Pass user text to Groq, then to Polly, then back to Twilio."""
+        if self.call_ended:
+            return
         self.is_bot_speaking = True
         
         if not hasattr(self, 'state_machine') or self.state_machine is None:
@@ -196,34 +203,7 @@ class VoiceConnectionManager:
             )
 
         try:
-            # 1. Dialogue State processing and classifications
-            classified_intent = None
-            schedule_info = None
-            
-            if self.state_machine.state == CallState.CHECK_PERMISSION:
-                classified_intent = await classify_permission(user_text)
-                logger.info(f"Permission Classification result: {classified_intent}")
-                
-            elif self.state_machine.state == CallState.QUALIFY and self.state_machine.qualify_turns == 1:
-                classified_intent = await classify_permission(user_text)
-                logger.info(f"Schedule confirmation Classification result: {classified_intent}")
-                
-            elif self.state_machine.state == CallState.SCHEDULE:
-                schedule_info = await extract_datetime(user_text)
-                logger.info(f"Schedule Extraction result: {schedule_info}")
-                # Only advance if user gave an actual day+time — else stay in SCHEDULE and re-ask
-                if not schedule_info or not schedule_info.get("day"):
-                    schedule_info = None
-
-            # 2. Get state instruction
-            state_instruction = self.state_machine.get_instruction_for_current_state(
-                user_text, 
-                classified_intent=classified_intent, 
-                schedule_info=schedule_info
-            )
-            logger.info(f"Current Call State: {self.state_machine.state.value}")
-            
-            # Update history
+            # 1. Update history with the user input
             self.state_machine.chat_history.append({"role": "user", "content": user_text})
 
             # Keep history manageable — system prompt + last 10 messages
@@ -232,23 +212,55 @@ class VoiceConnectionManager:
                     [self.state_machine.chat_history[0]]  # system prompt
                     + self.state_machine.chat_history[-10:]  # recent context
                 )
-            
-            messages = list(self.state_machine.chat_history)
-            messages.append({"role": "system", "content": state_instruction})
 
-            # 3. Get LLM Response
-            response = await groq_client.chat.completions.create(
-                model=config.LLM_MODEL or "llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.3,
-                max_tokens=150
+            intent = None
+            sched_info = None
+
+            if self.state_machine.state in (CallState.CHECK_PERMISSION, CallState.QUALIFY):
+                intent = await classify_permission(user_text)
+            elif self.state_machine.state == CallState.SCHEDULE:
+                sched_info = await extract_datetime(user_text)
+
+            instruction = self.state_machine.get_instruction_for_current_state(
+                user_text=user_text,
+                classified_intent=intent,
+                schedule_info=sched_info
             )
-            bot_text = response.choices[0].message.content.strip()
-            self.state_machine.chat_history.append({"role": "assistant", "content": bot_text})
-            logger.info(f"Bot: {bot_text}")
+            
+            call_is_ending = False
 
-            should_hangup = bool(re.search(r'\[CALL[\s_]*END\]', bot_text, re.IGNORECASE)) or self.state_machine.state == CallState.HANGUP
-            speak_text = re.sub(r'\[CALL[\s_]*END\]', '', bot_text, flags=re.IGNORECASE).strip()
+            if self.state_machine.state == CallState.HANGUP and instruction.startswith("The call has reached its limit"):
+                bot_text = "माफ़ कीजिएगा, यह call काफी लंबी हो गई है। मैं आपको बाद में कॉल करूँगी। [CALL_END]"
+                self.state_machine.chat_history.append({"role": "assistant", "content": bot_text})
+                logger.info(f"Bot (Max Turns): {bot_text}")
+                call_is_ending = True
+            else:
+                messages = list(self.state_machine.chat_history)
+                messages.append({"role": "system", "content": instruction})
+
+                # 2. Get LLM Response from Groq (Plain text)
+                response = await groq_client.chat.completions.create(
+                    model=config.LLM_MODEL or "llama-3.3-70b-versatile",
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=150
+                )
+                bot_text = response.choices[0].message.content.strip()
+                
+                self.state_machine.chat_history.append({
+                    "role": "assistant",
+                    "content": bot_text
+                })
+                logger.info(f"Bot: {bot_text}")
+
+                if "[CALL_END]" in bot_text or self.state_machine.state == CallState.HANGUP:
+                    call_is_ending = True
+                    self.state_machine.state = CallState.HANGUP
+            
+            speak_text = re.sub(r'\[(?:CALL[\s_]*END|END[\s_]*CALL)\]', '', bot_text, flags=re.IGNORECASE).strip()
+            speak_text = speak_text.replace("[HANG_UP]", "").strip()
+            speak_text = re.sub(r'\[APPOINTMENT:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
+            speak_text = re.sub(r'\[LEAD:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
 
             if speak_text:
                 # Convert Text to Speech using AWS Polly
@@ -290,7 +302,7 @@ class VoiceConnectionManager:
                     }
                     await self.twilio_ws.send_json(payload)
                     
-            if should_hangup:
+            if call_is_ending:
                 logger.info(f"Twilio Call Ending triggered — scoring lead and closing socket.")
                 await self._score_and_log_lead()
                 await asyncio.sleep(2.0)
@@ -303,7 +315,7 @@ class VoiceConnectionManager:
             self.last_speak_finished_time = 0.0 if self.welcome_interrupted else asyncio.get_event_loop().time()
             self.is_bot_speaking = False
             
-            if hasattr(self, 'barge_in_transcript') and self.barge_in_transcript:
+            if hasattr(self, 'barge_in_transcript') and self.barge_in_transcript and not self.call_ended:
                 transcript_to_process = self.barge_in_transcript
                 self.barge_in_transcript = ""
                 asyncio.create_task(self.process_llm_and_speak(transcript_to_process))
@@ -319,21 +331,28 @@ class VoiceConnectionManager:
             if not self.state_machine:
                 return
 
-            transcript_lines = [
-                f"{m['role']}: {m['content']}"
-                for m in self.state_machine.chat_history
-                if m['role'] in ('user', 'assistant')
-            ]
+            transcript_lines = []
+            for m in self.state_machine.chat_history:
+                if m['role'] in ('user', 'assistant'):
+                    role = m['role']
+                    content = m['content']
+                    if role == 'assistant':
+                        try:
+                            parsed = json.loads(content)
+                            content = parsed.get("response") or parsed.get("reply") or parsed.get("text") or content
+                        except Exception:
+                            pass
+                    transcript_lines.append(f"{role}: {content}")
             transcript = "\n".join(transcript_lines)
 
             scheduled_day = self.state_machine.scheduled_day
             scheduled_time = self.state_machine.scheduled_time
 
-            if self.state_machine.state == CallState.CONFIRM and scheduled_day:
+            if self.state_machine.scheduled_day and self.state_machine.scheduled_time:
                 outcome = "callback_scheduled"
-            elif self.state_machine.state == CallState.CONFIRM:
+            elif self.state_machine.scheduled_day:
                 outcome = "callback_agreed"
-            elif self.state_machine.state == CallState.HANGUP and self.state_machine.scheduled_day is None:
+            elif self.state_machine.state == CallState.HANGUP:
                 outcome = "not_interested"
             else:
                 outcome = "incomplete"
@@ -390,46 +409,53 @@ class VoiceConnectionManager:
     async def play_welcome_message(self, customer_name: str, bot_type: str):
         """Play the opening welcome message immediately without calling Groq first, reducing latency.
         Uses SSML for natural pauses between phrases.
-        Name is NOT used here — the LLM will naturally address the customer by name in its first response.
         """
-        if bot_type == "recruitment":
-            welcome_text = (
-                '<speak>Hello! <break time="300ms"/>'
-                'मैं Riya हूँ। <break time="300ms"/>'
-                'आपका profile देखा था, <break time="250ms"/>'
-                'और specifically आपको reach out करना था <break time="250ms"/>'
-                'एक part-time income model के बारे में <break time="200ms"/>'
-                'जो financial services में कुछ लोग कर रहे हैं Pune में। <break time="400ms"/>'
-                'आप 2 minute में सुन सकते हैं?</speak>'
+        if not hasattr(self, 'state_machine') or self.state_machine is None:
+            self.state_machine = VoiceStateMachine(
+                bot_type=bot_type, 
+                customer_name=customer_name, 
+                customer_category=getattr(self, 'customer_category', '')
             )
-        elif bot_type == "insurance":
-            welcome_text = (
-                '<speak>Hello! <break time="300ms"/>'
-                'मैं Aditi बोल रही हूँ। <break time="250ms"/>'
-                'एक quick चीज़ पूछना था, <break time="200ms"/>'
-                'अगर आज आपको hospital admit होना पड़े, <break time="300ms"/>'
-                'तो क्या आपके पास कोई coverage है <break time="200ms"/>'
-                'जो पूरा bill cover कर सके? <break time="400ms"/>'
-                'इसलिए call कर रही थी।</speak>'
-            )
-        else:  # investment
-            welcome_text = (
-                '<speak>Hello! <break time="300ms"/>'
-                'मैं Riya बोल रही हूँ कल्पवृक्ष Finserv से। <break time="300ms"/>'
-                'एक चीज़ notice की थी, <break time="250ms"/>'
-                'बहुत लोग Pune में अभी भी savings account में पैसा रख रहे हैं <break time="250ms"/>'
-                'जो actually inflation से पीछे जा रहा है। <break time="400ms"/>'
-                'क्या आप जानना चाहते हैं <break time="200ms"/>'
-                'इससे अच्छे options कौन से हैं?</speak>'
-            )
+
+        def generate_welcome_message(b_type: str, c_name: str, crm_context: dict = None) -> str:
+            ctx = crm_context or {}
+            profession    = ctx.get("profession", "")
+            business_name = ctx.get("business_name", "")
+            city          = ctx.get("city", "Pune")
+            gender        = ctx.get("gender", "M")
+
+            # ── Salutation ──────────────────────────────────
+            if business_name:
+                greeting_line = f'Namaste, <break time="150ms"/> क्या यह {business_name} है?'
+            else:
+                _BUSINESS_SIGNALS = {
+                    "pvt", "ltd", "llp", "inc", "corp", "limited",
+                    "clinic", "hospital", "pharmacy", "medical", "dental", "lab",
+                    "dr", "dr.", "doctor", "centre", "center",
+                    "enterprise", "enterprises", "traders", "trading", "agency",
+                    "store", "shop", "mart", "school", "college", "institute", "foundation", "trust",
+                    "associates", "works", "care", "studio"
+                }
+                name_lower = c_name.lower() if c_name else ""
+                tokens = name_lower.replace(".", " ").split()
+                is_business = bool(set(tokens) & _BUSINESS_SIGNALS)
+                if is_business:
+                    greeting_line = f'Namaste, <break time="150ms"/> क्या यह {c_name} है?'
+                else:
+                    greeting_line = f'Namaste {c_name} ji? <break time="150ms"/>' if c_name else f'Namaste? <break time="150ms"/>'
+
+            # Name Verification Check: Just return the greeting, don't include the hook.
+            # We add a slight interrogative pause so they respond.
+            return f'<speak>{greeting_line}</speak>'
+
+        welcome_text = generate_welcome_message(bot_type, customer_name, getattr(self, "crm_context", {}))
                 
-        self.state_machine = VoiceStateMachine(
-            bot_type=bot_type, 
-            customer_name=customer_name, 
-            customer_category=getattr(self, 'customer_category', '')
-        )
-        self.state_machine.state = CallState.CHECK_PERMISSION
-        self.state_machine.chat_history.append({"role": "assistant", "content": welcome_text})
+        self.state_machine.state = CallState.VERIFY_NAME
+        # Clean SSML tags for chat history
+        clean_welcome = welcome_text
+        clean_welcome = re.sub(r'<[^>]+>', '', clean_welcome)
+        clean_welcome = re.sub(r'\s+', ' ', clean_welcome).strip()
+        self.state_machine.chat_history.append({"role": "assistant", "content": clean_welcome})
         
         logger.info(f"Welcoming customer directly: {welcome_text}")
         
@@ -470,7 +496,7 @@ class VoiceConnectionManager:
             self.last_speak_finished_time = 0.0 if self.welcome_interrupted else asyncio.get_event_loop().time()
             self.is_bot_speaking = False
             
-            if hasattr(self, 'barge_in_transcript') and self.barge_in_transcript:
+            if hasattr(self, 'barge_in_transcript') and self.barge_in_transcript and not self.call_ended:
                 transcript_to_process = self.barge_in_transcript
                 self.barge_in_transcript = ""
                 asyncio.create_task(self.process_llm_and_speak(transcript_to_process))
@@ -604,8 +630,25 @@ class ExotelVoiceConnectionManager:
             except Exception as e:
                 logger.error(f"[Exotel] Error reading leads file: {e}")
                 
-        # Perform LLM classification on category if we have a category
-        if customer_category:
+        # --- CRM Context Extraction for Welcome Message ---
+        CATEGORY_MAP = {
+            "doctors in pune":               {"profession": "doctor",  "city": "Pune", "bot_type": "insurance"},
+            "architects in pune":            {"profession": "architect","city": "Pune", "bot_type": "recruitment"},
+            "chartered accountants":         {"profession": "CA",      "city": "Pune", "bot_type": "recruitment"},
+            "salaried professionals":        {"profession": "",        "city": "Pune", "bot_type": "investment"},
+            "investment":                    {"profession": "",        "city": "Pune", "bot_type": "investment"},
+            "insurance":                     {"profession": "",        "city": "Pune", "bot_type": "insurance"},
+            "reminder":                      {"profession": "",        "city": "Pune", "bot_type": "reminder"}
+        }
+        
+        self.crm_context = CATEGORY_MAP.get(customer_category.lower().strip(), {"profession": "", "city": "Pune"})
+        
+        # Bypass LLM classification if we already mapped the bot_type
+        mapped_bot_type = CATEGORY_MAP.get(customer_category.lower().strip(), {}).get("bot_type")
+        if mapped_bot_type:
+            bot_type = mapped_bot_type
+        elif customer_category:
+            # Only use LLM if it's an unknown category
             bot_type = await classify_bot_type(customer_category)
             logger.info(f"[Exotel] Classified lead category '{customer_category}' -> Bot Type: {bot_type}")
 
@@ -617,12 +660,18 @@ class ExotelVoiceConnectionManager:
         self.customer_name = customer_name
         self.customer_category = customer_category
         self.caller_phone = clean_phone  # Store for CRM logging at hangup
+            
+        # Infer business name if the customer name sounds like a business (simple heuristic)
+        if any(w in customer_name.lower() for w in ["clinic", "hospital", "associates", "enterprises", "solutions"]):
+            self.crm_context["business_name"] = customer_name
+            self.customer_name = ""  # Clear the name so we greet the business directly
+            
         self.state_machine = VoiceStateMachine(
             bot_type=bot_type, 
-            customer_name=customer_name, 
+            customer_name=self.customer_name, 
             customer_category=customer_category
         )
-        logger.info(f"[Exotel] Active Persona State Machine | Voice: {self.agent_voice} | Target Client: {customer_name} | Phone: {clean_phone} | Category: {customer_category}")
+        logger.info(f"[Exotel] Active Persona State Machine | Bot Type: {bot_type} | CRM Context: {self.crm_context} | Voice: {self.agent_voice} | Target Client: {self.customer_name} | Phone: {clean_phone} | Category: {customer_category}")
 
     async def connect_to_deepgram(self):
         """Establish WebSocket connection to Deepgram for live STT.
@@ -729,6 +778,10 @@ class ExotelVoiceConnectionManager:
                             cooldown_elapsed = now - self.last_speak_finished_time
                             
                             if self.is_bot_speaking:
+                                if getattr(self, 'state_machine', None) and self.state_machine.state == CallState.HANGUP:
+                                    logger.info(f"[Exotel] Ignoring barge-in '{clean_transcript}' because call is in final goodbye.")
+                                    continue
+                                
                                 # Barge-in: if user speaks during welcome/bot, interrupt it
                                 self.welcome_interrupted = True
                                 self.barge_in_transcript = clean_transcript
@@ -821,46 +874,54 @@ class ExotelVoiceConnectionManager:
 
     async def play_welcome_message(self, customer_name: str, bot_type: str):
         """Play the opening welcome message immediately without calling Groq first, reducing latency.
-        Uses SSML for natural pauses. Name is NOT used here — the LLM handles name usage naturally.
+        Uses the two-beat sales psychology system for natural pauses and context-aware hooking.
         """
-        if bot_type == "recruitment":
-            welcome_text = (
-                '<speak>Hello! <break time="300ms"/>'
-                'मैं Riya हूँ। <break time="300ms"/>'
-                'आपका profile देखा था, <break time="250ms"/>'
-                'और specifically आपको reach out करना था <break time="250ms"/>'
-                'एक part-time income model के बारे में <break time="200ms"/>'
-                'जो financial services में कुछ लोग कर रहे हैं Pune में। <break time="400ms"/>'
-                'आप 2 minute में सुन सकते हैं?</speak>'
+        if not hasattr(self, 'state_machine') or self.state_machine is None:
+            self.state_machine = VoiceStateMachine(
+                bot_type=bot_type, 
+                customer_name=customer_name, 
+                customer_category=getattr(self, 'customer_category', '')
             )
-        elif bot_type == "insurance":
-            welcome_text = (
-                '<speak>Hello! <break time="300ms"/>'
-                'मैं Aditi बोल रही हूँ। <break time="250ms"/>'
-                'एक quick चीज़ पूछना था, <break time="200ms"/>'
-                'अगर आज आपको hospital admit होना पड़े, <break time="300ms"/>'
-                'तो क्या आपके पास कोई coverage है <break time="200ms"/>'
-                'जो पूरा bill cover कर सके? <break time="400ms"/>'
-                'इसलिए call कर रही थी।</speak>'
-            )
-        else:  # investment
-            welcome_text = (
-                '<speak>Hello! <break time="300ms"/>'
-                'मैं Riya बोल रही हूँ कल्पवृक्ष Finserv से। <break time="300ms"/>'
-                'एक चीज़ notice की थी, <break time="250ms"/>'
-                'बहुत लोग Pune में अभी भी savings account में पैसा रख रहे हैं <break time="250ms"/>'
-                'जो actually inflation से पीछे जा रहा है। <break time="400ms"/>'
-                'क्या आप जानना चाहते हैं <break time="200ms"/>'
-                'इससे अच्छे options कौन से हैं?</speak>'
-            )
+
+        def generate_welcome_message(b_type: str, c_name: str, crm_context: dict = None) -> str:
+            ctx = crm_context or {}
+            profession    = ctx.get("profession", "")
+            business_name = ctx.get("business_name", "")
+            city          = ctx.get("city", "Pune")
+            gender        = ctx.get("gender", "M")
+
+            # ── Salutation (works for all three) ──────────────────────────────────
+            if business_name:
+                greeting_line = f'Namaste, <break time="150ms"/> क्या यह {business_name} है?'
+            else:
+                _BUSINESS_SIGNALS = {
+                    "pvt", "ltd", "llp", "inc", "corp", "limited",
+                    "clinic", "hospital", "pharmacy", "medical", "dental", "lab",
+                    "dr", "dr.", "doctor", "centre", "center",
+                    "enterprise", "enterprises", "traders", "trading", "agency",
+                    "store", "shop", "mart", "school", "college", "institute", "foundation", "trust",
+                    "associates", "works", "care", "studio"
+                }
+                name_lower = c_name.lower() if c_name else ""
+                tokens = name_lower.replace(".", " ").split()
+                is_business = bool(set(tokens) & _BUSINESS_SIGNALS)
+                if is_business:
+                    greeting_line = f'Namaste, <break time="150ms"/> क्या यह {c_name} है?'
+                else:
+                    greeting_line = f'Namaste {c_name} ji? <break time="150ms"/>' if c_name else f'Namaste? <break time="150ms"/>'
+
+            # Name Verification Check: Just return the greeting, don't include the hook.
+            # We add a slight interrogative pause so they respond.
+            return f'<speak>{greeting_line}</speak>'
+
+        welcome_text = generate_welcome_message(bot_type, customer_name, getattr(self, "crm_context", {}))
                 
-        self.state_machine = VoiceStateMachine(
-            bot_type=bot_type, 
-            customer_name=customer_name, 
-            customer_category=getattr(self, 'customer_category', '')
-        )
-        self.state_machine.state = CallState.CHECK_PERMISSION
-        self.state_machine.chat_history.append({"role": "assistant", "content": welcome_text})
+        self.state_machine.state = CallState.VERIFY_NAME
+        # Clean SSML tags for chat history
+        clean_welcome = welcome_text
+        clean_welcome = re.sub(r'<[^>]+>', '', clean_welcome)
+        clean_welcome = re.sub(r'\s+', ' ', clean_welcome).strip()
+        self.state_machine.chat_history.append({"role": "assistant", "content": clean_welcome})
         logger.info(f"[Exotel] Welcoming customer directly: {welcome_text}")
         
         self.is_bot_speaking = True
@@ -870,7 +931,7 @@ class ExotelVoiceConnectionManager:
             self.last_speak_finished_time = 0.0 if self.welcome_interrupted else asyncio.get_event_loop().time()
             self.is_bot_speaking = False
             
-            if hasattr(self, 'barge_in_transcript') and self.barge_in_transcript:
+            if hasattr(self, 'barge_in_transcript') and self.barge_in_transcript and not self.call_ended:
                 transcript_to_process = self.barge_in_transcript
                 self.barge_in_transcript = ""
                 asyncio.create_task(self.process_llm_and_speak(transcript_to_process))
@@ -894,36 +955,7 @@ class ExotelVoiceConnectionManager:
             )
 
         try:
-            # 1. Dialogue State processing and classifications
-            classified_intent = None
-            schedule_info = None
-            
-            # Perform specific classifications based on current state
-            if self.state_machine.state == CallState.CHECK_PERMISSION:
-                classified_intent = await classify_permission(user_text)
-                logger.info(f"[Exotel] Permission Classification result: {classified_intent}")
-                
-            elif self.state_machine.state == CallState.QUALIFY and self.state_machine.qualify_turns == 1:
-                # The user is answering whether to schedule the consultation
-                classified_intent = await classify_permission(user_text)
-                logger.info(f"[Exotel] Schedule confirmation Classification result: {classified_intent}")
-                
-            elif self.state_machine.state == CallState.SCHEDULE:
-                schedule_info = await extract_datetime(user_text)
-                logger.info(f"[Exotel] Schedule Extraction result: {schedule_info}")
-                # Only advance if user gave an actual day+time — else stay in SCHEDULE and re-ask
-                if not schedule_info or not schedule_info.get("day"):
-                    schedule_info = None
-
-            # 2. Get state instruction
-            state_instruction = self.state_machine.get_instruction_for_current_state(
-                user_text, 
-                classified_intent=classified_intent, 
-                schedule_info=schedule_info
-            )
-            logger.info(f"[Exotel] Current Call State: {self.state_machine.state.value}")
-            
-            # Update history with the user input
+            # 1. Update history with the user input
             self.state_machine.chat_history.append({"role": "user", "content": user_text})
 
             # Keep history manageable — system prompt + last 10 messages
@@ -932,26 +964,55 @@ class ExotelVoiceConnectionManager:
                     [self.state_machine.chat_history[0]]  # system prompt
                     + self.state_machine.chat_history[-10:]  # recent context
                 )
-            
-            # Build messages list: chat history + situational context
-            messages = list(self.state_machine.chat_history)
-            messages.append({"role": "system", "content": state_instruction})
 
-            # 3. Get LLM Response from Groq
-            response = await groq_client.chat.completions.create(
-                model=config.LLM_MODEL or "llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.3,
-                max_tokens=150
+            intent = None
+            sched_info = None
+
+            if self.state_machine.state in (CallState.CHECK_PERMISSION, CallState.QUALIFY):
+                intent = await classify_permission(user_text)
+            elif self.state_machine.state == CallState.SCHEDULE:
+                sched_info = await extract_datetime(user_text)
+
+            instruction = self.state_machine.get_instruction_for_current_state(
+                user_text=user_text,
+                classified_intent=intent,
+                schedule_info=sched_info
             )
-            bot_text = response.choices[0].message.content.strip()
-            self.state_machine.chat_history.append({"role": "assistant", "content": bot_text})
-            logger.info(f"[Exotel] Bot: {bot_text}")
+            
+            call_is_ending = False
 
-            # 4. Check for [CALL_END] tag (case-insensitive, flexible whitespace)
-            should_hangup = bool(re.search(r'\[CALL[\s_]*END\]', bot_text, re.IGNORECASE)) or self.state_machine.state == CallState.HANGUP
-            # Strip the tag before sending to Polly (we don't want it spoken)
-            speak_text = re.sub(r'\[CALL[\s_]*END\]', '', bot_text, flags=re.IGNORECASE).strip()
+            if self.state_machine.state == CallState.HANGUP and instruction.startswith("The call has reached its limit"):
+                bot_text = "माफ़ कीजिएगा, यह call काफी लंबी हो गई है। मैं आपको बाद में कॉल करूँगी। [CALL_END]"
+                self.state_machine.chat_history.append({"role": "assistant", "content": bot_text})
+                logger.info(f"[Exotel] Bot (Max Turns): {bot_text}")
+                call_is_ending = True
+            else:
+                messages = list(self.state_machine.chat_history)
+                messages.append({"role": "system", "content": instruction})
+
+                # 2. Get LLM Response from Groq (Plain text)
+                response = await groq_client.chat.completions.create(
+                    model=config.LLM_MODEL or "llama-3.3-70b-versatile",
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=150
+                )
+                bot_text = response.choices[0].message.content.strip()
+                
+                self.state_machine.chat_history.append({
+                    "role": "assistant",
+                    "content": bot_text
+                })
+                logger.info(f"[Exotel] Bot: {bot_text}")
+
+                if "[CALL_END]" in bot_text or self.state_machine.state == CallState.HANGUP:
+                    call_is_ending = True
+                    self.state_machine.state = CallState.HANGUP
+            
+            speak_text = re.sub(r'\[(?:CALL[\s_]*END|END[\s_]*CALL)\]', '', bot_text, flags=re.IGNORECASE).strip()
+            speak_text = speak_text.replace("[HANG_UP]", "").strip()
+            speak_text = re.sub(r'\[APPOINTMENT:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
+            speak_text = re.sub(r'\[LEAD:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
 
             duration_seconds = 0.0
             if speak_text:
@@ -963,9 +1024,9 @@ class ExotelVoiceConnectionManager:
             await asyncio.sleep(0.5)
 
             # 5. If [CALL_END] was detected or we moved to HANGUP, close sockets
-            if should_hangup:
+            if call_is_ending:
                 logger.info(f"[Exotel] Call Ending triggered — hanging up.")
-                await asyncio.sleep(1.0)  # Tiny extra buffer before closing sockets
+                await asyncio.sleep(3.5)  # Buffer to allow Exotel to finish playing audio
                 await self._hangup()
 
         except Exception as e:
@@ -977,7 +1038,7 @@ class ExotelVoiceConnectionManager:
                     '<break time="300ms"/> संजीव sir आपको जल्दी call करेंगे। '
                     '<break time="200ms"/> धन्यवाद!</speak>'
                 )
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(3.5)
                 await self._hangup()
             except Exception:
                 pass
@@ -985,7 +1046,7 @@ class ExotelVoiceConnectionManager:
             self.last_speak_finished_time = 0.0 if self.welcome_interrupted else asyncio.get_event_loop().time()
             self.is_bot_speaking = False
             
-            if hasattr(self, 'barge_in_transcript') and self.barge_in_transcript:
+            if hasattr(self, 'barge_in_transcript') and self.barge_in_transcript and not self.call_ended:
                 transcript_to_process = self.barge_in_transcript
                 self.barge_in_transcript = ""
                 asyncio.create_task(self.process_llm_and_speak(transcript_to_process))
@@ -999,11 +1060,18 @@ class ExotelVoiceConnectionManager:
             from server.sheets_manager import sheets_manager, whatsapp_notifier
 
             # Build conversation transcript
-            transcript_lines = [
-                f"{m['role']}: {m['content']}"
-                for m in self.state_machine.chat_history
-                if m['role'] in ('user', 'assistant')
-            ]
+            transcript_lines = []
+            for m in self.state_machine.chat_history:
+                if m['role'] in ('user', 'assistant'):
+                    role = m['role']
+                    content = m['content']
+                    if role == 'assistant':
+                        try:
+                            parsed = json.loads(content)
+                            content = parsed.get("response") or parsed.get("reply") or parsed.get("text") or content
+                        except Exception:
+                            pass
+                    transcript_lines.append(f"{role}: {content}")
             transcript = "\n".join(transcript_lines)
 
             # Extract scheduled time from state machine
@@ -1011,11 +1079,11 @@ class ExotelVoiceConnectionManager:
             scheduled_time = self.state_machine.scheduled_time
 
             # Determine call outcome
-            if self.state_machine.state == CallState.CONFIRM and scheduled_day:
+            if self.state_machine.scheduled_day and self.state_machine.scheduled_time:
                 outcome = "callback_scheduled"
-            elif self.state_machine.state == CallState.CONFIRM:
+            elif self.state_machine.scheduled_day:
                 outcome = "callback_agreed"
-            elif self.state_machine.state == CallState.HANGUP and self.state_machine.scheduled_day is None:
+            elif self.state_machine.state == CallState.HANGUP:
                 outcome = "not_interested"
             else:
                 outcome = "incomplete"

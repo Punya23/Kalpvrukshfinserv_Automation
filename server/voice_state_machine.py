@@ -1,494 +1,426 @@
 """
 Kalpvruksh Finserv — Voice Call State Machine
 
-Philosophy: The LLM is the product. We use a capable 70B model and invest in
-excellent prompts rather than compensating for a weak model with hardcoded
-fallbacks, keyword dictionaries, and regex patterns.
-
-Zero hardcoding. Zero manual fallbacks. Trust the model.
+Philosophy: Python is the navigator. The LLM is the speaker.
+- State transitions are deterministic Python — never delegated to the LLM.
+- Per-turn situational instructions tell the LLM exactly what situation it is in
+  and what its goal is for this turn, without bloating the system prompt.
+- classify_permission() and extract_datetime() are lightweight async classifiers
+  that pre-process user input before the main LLM call.
 """
 
 import re
 import json
 import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from enum import Enum
 from groq import AsyncGroq
 from server.config import config
 
 logger = logging.getLogger(__name__)
 
-# Initialize Groq client
 groq_client = AsyncGroq(api_key=config.GROQ_API_KEY)
 
-# ---------------------------------------------------------------
-# Model Selection
-# ---------------------------------------------------------------
-# Use the best model for EVERYTHING. The 70B model understands Hindi,
-# Hinglish, conversational nuance, and edge cases natively.
-# On Groq's infrastructure, 70B adds ~200-300ms vs 8B — negligible
-# for a voice call that already spends 1-2s on TTS.
-# ---------------------------------------------------------------
-CLASSIFIER_MODEL = "llama-3.3-70b-versatile"
+CLASSIFIER_MODEL  = "llama-3.3-70b-versatile"
 CONVERSATION_MODEL = config.LLM_MODEL or "llama-3.3-70b-versatile"
 
 
-class CallState(Enum):
-    GREETING = "GREETING"
-    CHECK_PERMISSION = "CHECK_PERMISSION"
-    QUALIFY = "QUALIFY"
-    SCHEDULE = "SCHEDULE"
-    CONFIRM = "CONFIRM"
-    HANGUP = "HANGUP"
+# ── State Definitions ──────────────────────────────────────────────
 
+class CallState(Enum):
+    VERIFY_NAME      = "VERIFY_NAME"        # Verifying name; waiting for yes or name correction
+    CHECK_PERMISSION = "CHECK_PERMISSION"   # Welcome played; waiting for permission to continue
+    QUALIFY          = "QUALIFY"            # Discovery and curiosity building
+    SCHEDULE         = "SCHEDULE"           # Collecting day + time for Sanjeev sir's callback
+    CONFIRM          = "CONFIRM"            # Both day + time received; confirming appointment
+    HANGUP           = "HANGUP"             # Final state; call ending
+
+ALLOWED_TRANSITIONS = {
+    "VERIFY_NAME":      {"QUALIFY", "HANGUP"},
+    "CHECK_PERMISSION": {"QUALIFY", "HANGUP"},
+    "QUALIFY":          {"QUALIFY", "SCHEDULE", "HANGUP"},
+    "SCHEDULE":         {"SCHEDULE", "CONFIRM", "HANGUP"},
+    "CONFIRM":          {"CONFIRM", "HANGUP"},
+    "HANGUP":           {"HANGUP"},
+}
+
+def apply_transition(current: str, requested: str) -> str:
+    """Guard rail: only allows whitelisted transitions. Logs and blocks invalid ones."""
+    allowed = ALLOWED_TRANSITIONS.get(current, set())
+    if requested in allowed:
+        return requested
+    logger.warning(f"Blocked invalid transition: {current} → {requested}. Staying in {current}.")
+    return current
+
+
+# ── Date / Time Normalizers ────────────────────────────────────────
+
+def normalize_scheduled_date(date_str: str) -> str | None:
+    """Convert natural language dates ('kal', 'tomorrow', 'Monday') to YYYY-MM-DD in IST."""
+    if not date_str or str(date_str).strip().lower() in ("null", "none", ""):
+        return None
+    s = str(date_str).strip().lower()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    ist = ZoneInfo("Asia/Kolkata")
+    now = datetime.now(ist)
+    if "today" in s or "aaj" in s:
+        return now.strftime("%Y-%m-%d")
+    if "tomorrow" in s or "kal" in s:
+        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    if "day after" in s or "parso" in s or "parson" in s:
+        return (now + timedelta(days=2)).strftime("%Y-%m-%d")
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    for i, day in enumerate(days):
+        if day in s:
+            ahead = i - now.weekday()
+            if ahead <= 0 or "next" in s:
+                ahead += 7
+            return (now + timedelta(days=ahead)).strftime("%Y-%m-%d")
+    return None
+
+def normalize_scheduled_time(time_str: str) -> str | None:
+    """Convert natural language times ('shaam 5 baje', '5 PM') to HH:MM (24-hour)."""
+    if not time_str or str(time_str).strip().lower() in ("null", "none", ""):
+        return None
+    s = str(time_str).strip().upper()
+    if re.match(r"^\d{2}:\d{2}$", s):
+        return s
+    try:
+        if "PM" in s or "AM" in s:
+            return datetime.strptime(s.replace(" ", ""), "%I:%M%p").strftime("%H:%M")
+    except ValueError:
+        try:
+            return datetime.strptime(s.replace(" ", ""), "%I%p").strftime("%H:%M")
+        except ValueError:
+            pass
+    return s  # Return as-is when parsing fails — still usable for display
+
+
+# ── Async LLM Classifiers ──────────────────────────────────────────
+
+async def classify_permission(user_text: str) -> str:
+    """
+    Classify user intent as YES / NO / MAYBE.
+    Used for: permission check (CHECK_PERMISSION state) and
+    scheduling agreement (QUALIFY → SCHEDULE transition).
+
+    YES   = agreement, interest, curiosity, questions (curiosity = soft yes)
+    NO    = clear refusal, go away, remove number, not interested
+    MAYBE = hesitant, busy but not refusing, asking for more info
+    """
+    prompt = (
+        "You are classifying intent from a voice call.\n"
+        "Output exactly one word: YES, NO, or MAYBE.\n\n"
+        "YES  → agreement, interest, curiosity, willingness, questions (questions = interest)\n"
+        "NO   → They clearly refused the pitch or showed hostility: nahi, no, not interested, timepass mat karo, scam hai, fraud\n"
+        "MAYBE → hesitant, busy, unclear, asking for more info before deciding\n\n"
+        f'User said: "{user_text}"\n\nClassification:'
+    )
+    try:
+        res = await groq_client.chat.completions.create(
+            model=CLASSIFIER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=5,
+        )
+        result = re.sub(r"[^A-Z]", "", res.choices[0].message.content.strip().upper())
+        return result if result in ("YES", "NO", "MAYBE") else "MAYBE"
+    except Exception as e:
+        logger.error(f"classify_permission error: {e}")
+        return "MAYBE"  # Safe default — keeps call alive
+
+
+async def extract_datetime(user_text: str) -> dict:
+    """
+    Extract appointment day and time from user speech.
+    Returns: {"day": "YYYY-MM-DD or None", "time": "HH:MM or None"}
+    """
+    prompt = (
+        "Extract appointment scheduling info from this voice call response.\n"
+        "Respond ONLY with valid JSON — no markdown, no explanation.\n\n"
+        '{"day": "<today|tomorrow|day after tomorrow|Monday|...> or null", '
+        '"time": "<5 PM|10:30 AM|2 PM|...> or null"}\n\n'
+        "Extract only what is explicitly mentioned. Null if not mentioned.\n\n"
+        f'User said: "{user_text}"\n\nJSON:'
+    )
+    try:
+        res = await groq_client.chat.completions.create(
+            model=CLASSIFIER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=50,
+        )
+        raw = re.sub(r"```json|```", "", res.choices[0].message.content.strip()).strip()
+        parsed = json.loads(raw)
+        return {
+            "day":  normalize_scheduled_date(parsed.get("day")),
+            "time": normalize_scheduled_time(parsed.get("time")),
+        }
+    except Exception as e:
+        logger.error(f"extract_datetime error: {e}")
+        return {"day": None, "time": None}
+
+
+async def classify_bot_type(category: str) -> str:
+    """
+    Route a lead to the correct bot based on their profession/category.
+    Uses LLM semantics — no hardcoded keyword dictionaries.
+    Defaults to 'investment' when uncertain.
+    """
+    if not category or not category.strip():
+        return "investment"
+    prompt = (
+        "Route this lead to the correct sales bot. Output ONE word only.\n\n"
+        "INVESTMENT  → business owners, salaried professionals, HNIs, anyone needing wealth/financial planning\n"
+        "INSURANCE   → healthcare workers, doctors, dentists, clinics, hospitals, medical field\n"
+        "RECRUITMENT → existing financial advisors, insurance agents, MFDs, CAs, wealth managers\n"
+        "Default: INVESTMENT when unsure.\n\n"
+        f'Lead category: "{category}"\n\nAnswer:'
+    )
+    try:
+        res = await groq_client.chat.completions.create(
+            model=CLASSIFIER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=10,
+        )
+        result = re.sub(r"[^A-Z]", "", res.choices[0].message.content.strip().upper())
+        return {"INVESTMENT": "investment", "INSURANCE": "insurance", "RECRUITMENT": "recruitment"}.get(result, "investment")
+    except Exception as e:
+        logger.error(f"classify_bot_type error: {e}")
+        return "investment"
+
+
+# ── Core State Machine ─────────────────────────────────────────────
 
 class VoiceStateMachine:
     """
-    Manages conversation flow state. Uses descriptive situation-based
-    instructions rather than prescriptive scripts. The LLM decides
-    what to say — we just tell it what's happening and what the goal is.
+    One instance per call. Owns state, chat history, and scheduled appointment.
+
+    Python drives transitions via get_instruction_for_current_state().
+    The LLM only decides what words to speak — it never controls state.
     """
 
     def __init__(self, bot_type: str, customer_name: str = "", customer_category: str = ""):
-        self.state = CallState.GREETING
-        self.bot_type = bot_type  # "investment", "insurance", "recruitment"
-        self.customer_name = customer_name or ""
+        self.state             = CallState.CHECK_PERMISSION
+        self.bot_type          = bot_type
+        self.customer_name     = customer_name or ""
         self.customer_category = customer_category or ""
-        self.qualify_turns = 0
-        self.scheduled_day = None
-        self.scheduled_time = None
-        self.chat_history = []
-        self.total_turns = 0
-
+        self.scheduled_day     = None
+        self.scheduled_time    = None
+        self.qualify_turns     = 0   # Turns spent in QUALIFY — gates the scheduling offer
+        self.recovery_count    = 0   # Consecutive soft refusals in QUALIFY
+        self.total_turns       = 0   # Hard limit guard
+        self.chat_history      = []
         self._initialize_persona()
 
     def _initialize_persona(self):
         """
-        Build a comprehensive persona prompt optimized for spoken output.
-        
-        Key insight: Polly Kajal is a Hindi TTS (hi-IN). When it sees Roman-script
-        Hindi like "main", it reads it as the English word "main". By writing Hindi
-        in Devanagari (मैं), Polly pronounces it correctly. This is the logical fix —
-        match the output format to the TTS engine's expected input.
+        Load the correct prompt file and inject customer context.
+        The system prompt goes in once at init; per-turn context is
+        injected separately via get_instruction_for_current_state().
         """
+        from pathlib import Path
 
-        # --- Identity by bot type ---
-        if self.bot_type == "insurance":
+        prompt_map = {
+            "insurance":   "prompts/insurance_bot_prompt.txt",
+            "recruitment": "prompts/advisor_recruitment_bot_prompt.txt",
+            "investment":  "prompts/investment_bot_prompt.txt",
+        }
+        prompt_path = Path(prompt_map.get(self.bot_type, "prompts/investment_bot_prompt.txt"))
+        try:
             identity_block = (
-                "You are Aditi, a warm and genuinely caring health insurance advisor "
-                "at कल्पवृक्ष Finserv, Pune (partnered with Star Health). "
-                "You help families understand the importance of health coverage. "
-                "You know about Star Health plans, family floater policies, and claim processes."
+                prompt_path.read_text(encoding="utf-8")
+                if prompt_path.exists()
+                else f"You are a warm, helpful {self.bot_type} advisor at Kalpvruksh Finserv, Pune."
             )
-        elif self.bot_type == "recruitment":
-            identity_block = (
-                "You are Riya, a warm and professional recruitment specialist "
-                "at कल्पवृक्ष Finserv, Pune. You call independent insurance/loan agents "
-                "and financial advisors to invite them to join as Wealth Partners. "
-                "You offer access to 30+ mutual fund houses, Star Health, automated HNI "
-                "lead generation, and competitive payouts."
-            )
-        else:  # investment (default)
-            identity_block = (
-                "You are Riya, a warm, friendly, and genuinely helpful financial advisor "
-                "at कल्पवृक्ष Finserv, Pune. You help people understand how to grow their "
-                "savings beyond traditional FDs and savings accounts."
-            )
+        except Exception as e:
+            logger.error(f"Failed to read prompt file '{prompt_path}': {e}")
+            identity_block = f"You are a warm, helpful {self.bot_type} advisor at Kalpvruksh Finserv, Pune."
 
-        # --- Name handling — let the LLM use its judgment ---
+        # Name block — let the LLM use judgment; don't force awkward name usage
         if self.customer_name.strip():
             name_block = (
-                f'CUSTOMER NAME FROM OUR DATABASE: "{self.customer_name}"\n'
-                "Use your judgment when addressing the customer:\n"
-                "- If this is a valid person's name, address them warmly using it.\n"
-                "- If it is not a valid person's name (e.g. a business category/name, a placeholder, or a generic term), "
-                'just address them respectfully using "आप" without using any name.'
+                f'CUSTOMER NAME FROM DATABASE: "{self.customer_name}"\n'
+                'If it looks like a category, placeholder, or business term, use "आप" respectfully.'
             )
         else:
-            name_block = (
-                "The customer's name is not known. Do NOT guess or make up a name. "
-                'Use respectful "आप" language throughout.'
-            )
+            name_block = 'Customer name unknown. Use "आप" respectfully throughout. Never guess or invent a name.'
 
-        # --- Customer context — gives the LLM profession/category info ---
         if self.customer_category.strip():
             name_block += (
-                f'\n\nCUSTOMER CONTEXT: This person is from the "{self.customer_category}" category in our database. '
-                "Use this context naturally in your conversation — for example, relate your offering to their profession. "
-                "Do NOT awkwardly mention their category verbatim; weave it in naturally."
+                f'\nCUSTOMER CONTEXT: Category is "{self.customer_category}". '
+                "Weave this into the conversation naturally — do NOT say the category word verbatim."
             )
 
-        # --- Build the full persona ---
         persona = f"""{identity_block}
 
-WRITING FORMAT — THIS IS CRITICAL:
-Your text will be read aloud by a Hindi text-to-speech engine (AWS Polly, Kajal voice, hi-IN).
-You MUST follow this writing format for correct pronunciation:
+TTS SCRIPT RULES (Critical for Polly pronunciation):
+- Hindi/Hinglish words → Devanagari: मैं, आप, अच्छा, कल, ठीक है, बिल्कुल
+- Financial/English terms → Latin: SIP, mutual funds, savings, insurance, consultation, Kalpvruksh Finserv
+- Founder name in Devanagari: संजीव सुराना — never "Sandeep Khurana" or any other name
+- NEVER transliterate Hindi into Latin script (never write "main", "aap", "achha")
 
-1. Write ALL Hindi/Hinglish words in DEVANAGARI SCRIPT:
-   मैं, बोल रही हूँ, आप, अच्छा, देखिए, बताइए, हाँ, नहीं, बिल्कुल, ठीक है, कल, परसों
-2. Write ALL English words in ENGLISH (Latin) script:
-   savings, account, mutual funds, investment, consultation, FD, SIP, returns
-3. This creates natural code-mixed text. Examples:
-   ✅ "अच्छा, actually आपकी savings कहाँ invest हैं?"
-   ✅ "बिल्कुल! संजीव सुराना sir आपको personally guide करेंगे।"
-   ✅ "मैं समझती हूँ, आपके लिए एक free consultation arrange कर देती हूँ।"
-4. NEVER write Hindi words in Roman/Latin script. The TTS will mispronounce them:
-   ❌ "main bol rahi hoon" → TTS reads "main" as English word "MAIN"
-   ❌ "achha" → TTS doesn't know this is अच्छा
-   ❌ "Surana" → TTS may mispronounce as "Khurana"
-   ✅ Always write: मैं बोल रही हूँ, अच्छा, सुराना
-5. Proper nouns in Devanagari: संजीव सुराना sir, कल्पवृक्ष Finserv
-6. STRICT NAME RULE: The founder's name is EXACTLY संजीव सुराना (Sanjeev Surana). NEVER call him "संदीप खुराना" (Sandeep Khurana).
-7. Use correct Hinglish verb forms. Never say "invest है" — say "invested हैं" or "invest किया है". Apply this to all English verbs used with Hindi grammar.
+OUTPUT RULES:
+- Max 2 sentences, 30 words per turn. One question only. Then stop.
+- NEVER repeat the customer's name during the conversation. Address them by name only at the very start or end. Repeatedly saying their name sounds robotic and irritating.
+- Sound like a smart, caring friend — never a telecaller reading a script.
+- To end call: append [CALL_END] to your final farewell sentence and nowhere else.
+- To confirm appointment: output [APPOINTMENT: day=<YYYY-MM-DD>, time=<HH:MM>, name=<name or unknown>]
+  on its own line, then the farewell + [CALL_END].
 
-PERSONALITY & SPOKEN NATURALNESS:
-- You are on a PHONE CALL. Your text will be spoken aloud, not read on a screen.
-- Sound like a smart, caring friend who knows about finance — NOT a telecaller or IVR system.
-- Start responses with a natural reaction to what they said, not a rehearsed line.
-- Add brief pauses with "..." between thoughts for natural rhythm:
-  "अच्छा... तो आपकी savings mostly FD में हैं?"
-- Use warm expressions naturally: "बिल्कुल!", "जी, बहुत अच्छे", "सही कहा!"
-- DO NOT use over-enthusiastic words like "वाह!" (Wow!), especially when scheduling a call or doing logistical tasks.
-- Vary your openings — don't always start with the same word.
-- When acknowledging, sound genuinely interested, not mechanical.
-
-GENDER GRAMMAR — YOU ARE FEMALE:
-In ALL Hindi portions, ALWAYS use feminine verb forms:
-✅ "मैं बोल रही हूँ", "मैं चाहती हूँ", "मैं बताती हूँ", "मैंने सोचा", "मैं समझती हूँ", "मैं कर सकती हूँ"
-❌ NEVER: "मैं बोल रहा हूँ", "मैं चाहता हूँ", "मैं बताता हूँ" — these are masculine forms.
-
-{name_block}
-
-CONVERSATION RULES:
-1. Keep EVERY response to 1-2 sentences maximum. Then STOP and let them speak.
-2. Ask only ONE question at a time. Never stack multiple questions.
-3. Mirror their energy — if they're enthusiastic, be enthusiastic. If cautious, be gentle.
-4. NEVER fabricate information, promise specific returns, quote percentages, or recommend specific funds/plans.
-5. NEVER argue with the customer, even if they say something factually wrong.
-6. If someone is angry, hostile, or uses harsh language — immediately apologize warmly, thank them, and end the call.
-7. Your job is ONLY to qualify the lead and book a callback with संजीव सुराना sir. You do NOT close deals.
-
-COMPANY CONTEXT:
-- Company: कल्पवृक्ष Finserv, Pune (15 years in business)
-- Senior Advisor: संजीव सुराना sir (founder, 15+ years experience) — this is who you schedule callbacks with
-- Your role: Qualify leads → Schedule callback with संजीव sir → End call
-
-THE [CALL_END] TAG:
-When the conversation is truly ending — they said bye, refused, got angry, or you've confirmed a callback — append [CALL_END] at the very end.
-Examples:
-- "धन्यवाद मुझसे बात करने के लिए, आपका दिन शुभ हो। [CALL_END]"
-- "संजीव sir कल पाँच बजे call करेंगे। धन्यवाद मुझसे बात करने के लिए, आपका दिन शुभ हो। [CALL_END]"
-NEVER use [CALL_END] while you are still asking questions or waiting for their response."""
+{name_block}"""
 
         self.chat_history.append({"role": "system", "content": persona})
 
     def get_instruction_for_current_state(
         self,
-        user_input: str,
-        classified_intent: str = None,
-        schedule_info: dict = None,
+        user_text: str,
+        classified_intent: str | None = None,
+        schedule_info: dict | None = None,
     ) -> str:
         """
-        Generate situational context for the LLM based on conversation state.
+        The core navigator. Called once per turn, before the main LLM call.
 
-        These instructions describe WHAT IS HAPPENING and WHAT THE GOAL IS.
-        They do NOT prescribe exact words. The LLM decides how to speak naturally.
+        Responsibilities:
+        1. Drive state transitions based on classified_intent and schedule_info.
+        2. Return a brief situational instruction (injected as a system message)
+           telling the LLM what situation it is in and what its goal is this turn.
+        3. Enforce the hard turn limit.
         """
         self.total_turns += 1
 
-        # Safety valve: prevent infinite conversations
+        # Hard turn limit — cost control and troll protection
         if self.total_turns >= 15:
             self.state = CallState.HANGUP
+            return "The call has reached its limit. Wrap up warmly and append [CALL_END]."
+            
+        # ── VERIFY_NAME ──────────────────────────────────────────────
+        if self.state == CallState.VERIFY_NAME:
+            self.state = CallState.QUALIFY
+            
+            if self.bot_type == "insurance":
+                hook = "agar aaj aapko hospital admit hona pade, to kya aapke paas poora bill cover karne ki coverage hai?"
+                bot_name = "Aarav"
+            elif self.bot_type == "recruitment":
+                hook = "hum Pune mein selected logo ke saath milkar business expand kar rahe hain. Kya aap hamare saath milkar khudka buisness karna chahte hoo?"
+                bot_name = "Riya"
+            else:
+                hook = "kya aap aaj kal apne paison ko badhane ya sahi jagah invest karne ke baare mein soch rahe hain?"
+                bot_name = "Riya"
+                
             return (
-                "This conversation has been going on for a while. "
-                "It's time to wrap up gracefully. Thank the customer for their time, "
-                "let them know संजीव sir will reach out soon, and say a warm goodbye. "
-                "Include [CALL_END] at the end."
+                "The user just responded to your initial 'Namaste'. "
+                f"1. If they confirmed their name, say: 'Main Kalpvruksh Finserv se {bot_name} bol rahi hoon. {hook}'\n"
+                f"2. If they said they are someone else, apologize, use their NEW name warmly, and say: 'Main Kalpvruksh Finserv se {bot_name} bol rahi hoon.  {hook}'\n"
+                f"3. If they asked who is calling, say: 'Main Kalpvruksh Finserv se {bot_name} bol rahi hoon. {hook}'\n"
+                "Do NOT pitch anything else yet. Just state this exact sentence translated naturally to Hinglish."
             )
 
-        # ----- CHECK_PERMISSION state -----
+        # ── CHECK_PERMISSION ─────────────────────────────────────────
         if self.state == CallState.CHECK_PERMISSION:
-            if classified_intent == "NO":
-                self.state = CallState.HANGUP
-                return (
-                    "The customer is not interested or declined to talk. "
-                    "Gracefully apologize for the disturbance, thank them, and end the call warmly. "
-                    "No pushing, no convincing, no follow-up questions. "
-                    "Include [CALL_END] at the end."
-                )
-            elif classified_intent == "BUSY":
-                self.state = CallState.SCHEDULE
-                return (
-                    "The customer sounds busy right now but hasn't refused outright. "
-                    "Briefly and warmly ask when they'd be free for a callback. "
-                    "STRICT RULE: Do NOT suggest, list, or offer any specific days or time slots. "
-                    "Simply ask 'आप कब free होंगे?' and STOP. Let them answer. "
-                    "Do NOT include [CALL_END]."
-                )
-            else:  # YES or ambiguous → give benefit of the doubt
+            if classified_intent == "YES":
                 self.state = CallState.QUALIFY
-                if self.bot_type == "insurance":
-                    return (
-                        "The customer agreed to talk! Start qualifying. "
-                        "Ask about their current health insurance situation — do they have family coverage, "
-                        "or are they exploring options? One natural question."
-                    )
-                elif self.bot_type == "recruitment":
-                    return (
-                        "The customer agreed to talk! Start qualifying. "
-                        "Ask if they're currently working as an insurance or financial advisor, "
-                        "or looking for new income opportunities. One natural question."
-                    )
-                else:  # investment
-                    return (
-                        "The customer agreed to talk! Start qualifying by asking where their savings "
-                        "currently are — FD, savings account, mutual funds, or something else. "
-                        "This gets them talking about their situation. One natural question."
-                    )
-
-        # ----- QUALIFY state -----
-        elif self.state == CallState.QUALIFY:
-            if classified_intent == "NO":
-                self.qualify_turns += 1
                 return (
-                    "The customer explicitly stated they already have investments/insurance or are not interested. "
-                    "DO NOT blindly pitch. Acknowledge their situation and gracefully ask if they'd be open to a casual, no-obligation portfolio review with संजीव sir instead. "
-                    "1-2 sentences max."
+                    "The customer engaged positively with the opening hook. "
+                    "Start discovery with one relevant open question based on their answer. "
+                    "Do NOT pitch anything yet — just listen."
+                )
+            elif classified_intent == "NO":
+                self.state = CallState.HANGUP
+                return "The customer refused or indicated it is a wrong number. Apologize gracefully and naturally based on context, say goodbye warmly, and append [CALL_END]." 
+            else:  # MAYBE
+                return (
+                    "The customer seems hesitant or was unclear. "
+                    "Acknowledge their response warmly and make one more gentle attempt to get permission. "
+                    "Do not pitch — just ask for two minutes of their time."
                 )
 
-            if self.qualify_turns == 0:
+        # ── QUALIFY ──────────────────────────────────────────────────
+        elif self.state == CallState.QUALIFY:
+            if classified_intent == "YES":
+                self.recovery_count = 0
                 self.qualify_turns += 1
-                if self.bot_type == "insurance":
-                    return (
-                        "The customer just shared their insurance situation. "
-                        "Acknowledge what they said naturally, then pivot to offering a free "
-                        "consultation with senior advisor संजीव सुराना sir for a personalized review. "
-                        "Ask if they'd be open to a brief call from him. 1-2 sentences max."
-                    )
-                elif self.bot_type == "recruitment":
-                    return (
-                        "The customer shared their professional background. "
-                        "Acknowledge it warmly, then briefly pitch the कल्पवृक्ष partnership opportunity "
-                        "(30+ brands, leads, payouts). Suggest a meeting with संजीव सुराना sir. "
-                        "1-2 sentences max."
-                    )
-                else:  # investment
-                    return (
-                        "The customer told you about their savings. "
-                        "Acknowledge what they said naturally, then mention that there are "
-                        "options that could work better for them. Offer a free consultation by first introducing संजीव सुराना sir — mention that he is the founder of Kalpavriksha Finserv with 15+ years of experience in wealth management. Then ask if you can schedule a free call with him personally. Example: \"हमारे साथ संजीव सुराना sir हैं — वो इस field में 15 साल से हैं और कल्पवृक्ष Finserv के founder हैं। वो personally आपको एक free consultation देना चाहते हैं। क्या मैं उनसे आपकी एक short call schedule करवा सकती हूँ?\""
-                    )
-            else:
-                # This is their response to "Can I schedule a consultation?"
-                if classified_intent == "NO":
-                    self.state = CallState.HANGUP
-                    return (
-                        "The customer declined the consultation offer. "
-                        "Respond gracefully — thank them, wish them well, end warmly. "
-                        "No pushing. Include [CALL_END] at the end."
-                    )
-                else:
+                # Keep the conversation going for at least 2 qualify turns
+                # before offering the consultation — builds engagement and call length
+                if self.qualify_turns >= 2:
                     self.state = CallState.SCHEDULE
                     return (
-                        "STRICT INSTRUCTION: The user has agreed to a callback but has NOT given a day or time yet. You MUST ask for their availability before confirming anything. Your response must be ONLY: \"ठीक है जी! आप किस दिन और किस समय free होंगे?\" — Do NOT suggest a day. Do NOT suggest a time. Do NOT say \"kal\" or \"5 baje\" or any specific slot. Just ask the open question and wait."
+                        "The customer is genuinely interested after good discovery. "
+                        "Now transition naturally: introduce the free consultation with संजीव सुराना "
+                        "and ask for a convenient day and time. Keep it warm and low-pressure."
                     )
-
-        # ----- SCHEDULE state -----
-        elif self.state == CallState.SCHEDULE:
-            if schedule_info and schedule_info.get("status") == "TimeGiven":
-                self.state = CallState.CONFIRM
-                self.scheduled_day = schedule_info.get("day")
-                self.scheduled_time = schedule_info.get("time")
-
-                meet_word = "meeting" if self.bot_type == "recruitment" else "call"
                 return (
-                    f"The customer wants the callback on {self.scheduled_day} at {self.scheduled_time}. "
-                    f"Confirm that संजीव sir will {meet_word} them at this time. "
-                    "Thank them warmly and wish them a great day. "
-                    "Include [CALL_END] at the end."
+                    f"The customer is engaged (qualify turn {self.qualify_turns}/2). "
+                    "Ask ONE more discovery question to deepen the conversation. "
+                    "Build curiosity with a relatable insight before pitching the consultation."
+                )
+            elif classified_intent == "NO":
+                self.recovery_count += 1
+                if self.recovery_count >= 3:
+                    self.state = CallState.HANGUP
+                    return (
+                        "After three recovery attempts the customer is still not interested. "
+                        "Thank them sincerely and append [CALL_END]."
+                    )
+                return (
+                    f"Soft refusal — recovery attempt {self.recovery_count}/3. "
+                    "Do NOT end the call. Use a completely fresh angle: a surprising insight, "
+                    "a relatable story, or a new question. Never repeat what you already said."
+                )
+            else:  # MAYBE
+                return (
+                    "The customer is uncertain. Validate their hesitation empathetically, "
+                    "share one brief relatable insight, and ask one gentle follow-up question. "
+                    "Keep them talking — engagement is the goal."
+                )
+
+        # ── SCHEDULE ─────────────────────────────────────────────────
+        elif self.state == CallState.SCHEDULE:
+            day  = (schedule_info or {}).get("day")
+            time = (schedule_info or {}).get("time")
+
+            if day:
+                self.scheduled_day = day
+            if time:
+                self.scheduled_time = time
+
+            if self.scheduled_day and self.scheduled_time:
+                self.state = CallState.CONFIRM
+                return (
+                    f"Both day ({self.scheduled_day}) and time ({self.scheduled_time}) are confirmed. "
+                    f"Output: [APPOINTMENT: day={self.scheduled_day}, time={self.scheduled_time}, "
+                    f"name={self.customer_name or 'unknown'}] "
+                    "Then confirm the slot warmly and append [CALL_END]."
+                )
+            elif self.scheduled_day and not self.scheduled_time:
+                return (
+                    f"Day is set ({self.scheduled_day}) but time is missing. "
+                    "Ask specifically: kis samay convenient rahega?"
+                )
+            elif self.scheduled_time and not self.scheduled_day:
+                return (
+                    f"Time is set ({self.scheduled_time}) but day is missing. "
+                    "Ask: aaj ya kal — kab better rahega?"
                 )
             else:
-                # They didn't give a clear day/time
                 return (
-                    "The customer's response didn't contain a clear day or time. "
-                    "Gently ask them again — when would be convenient for the callback? "
-                    "Let them choose. One natural sentence. Do NOT include [CALL_END]."
+                    "Neither day nor time collected yet. "
+                    "Ask clearly and simply: aap kab free honge — aur kis samay?"
                 )
 
-        # ----- CONFIRM / HANGUP state -----
-        elif self.state in (CallState.CONFIRM, CallState.HANGUP):
+        # ── CONFIRM ──────────────────────────────────────────────────
+        elif self.state == CallState.CONFIRM:
+            self.state = CallState.HANGUP
             return (
-                "The conversation is ending. Say a warm goodbye. "
-                "Include [CALL_END] at the end."
+                f"Appointment confirmed: {self.scheduled_day} at {self.scheduled_time}. "
+                f"Output: [APPOINTMENT: day={self.scheduled_day}, time={self.scheduled_time}, "
+                f"name={self.customer_name or 'unknown'}] "
+                "Then say a warm, genuine goodbye and append [CALL_END]."
             )
 
-        # ----- Fallback -----
-        return "Continue the conversation naturally. Be helpful, warm, and brief."
-
-
-# ===================================================================
-# INTELLIGENT LLM CLASSIFIERS
-#
-# These use the 70B model with carefully crafted prompts.
-# NO hardcoded fallbacks. NO keyword dictionaries. NO regex parsing.
-# The model understands Hindi/Hinglish natively — trust it.
-# ===================================================================
-
-async def classify_permission(user_input: str) -> str:
-    """
-    Determine if the customer agreed to talk, refused, or is busy.
-
-    Uses 70B model at temperature=0.0 for deterministic classification.
-    No keyword fallback — the model handles all languages and edge cases.
-    """
-    prompt = (
-        "You are classifying a customer's response during a phone call.\n\n"
-        "CONTEXT: An AI assistant just introduced herself and asked the customer "
-        "if they can spare 30 seconds. The customer responded with the text below.\n\n"
-        "Classify their response as exactly ONE of these three categories:\n\n"
-        "YES — They agreed, showed interest, gave permission, or responded with any "
-        "affirmative/neutral greeting. This includes:\n"
-        "  - Direct agreement: haan, ok, sure, yes, theek hai, chalo, boliye\n"
-        "  - Engagement: bolo, batao, sunao, karo baat, bataiye\n"
-        "  - Greetings that imply willingness: hello, hi, ji, ji boliye, haan ji\n"
-        "  - Ambiguous/unclear/noisy responses (give benefit of the doubt)\n"
-        "  - Any single word or short response that isn't a clear refusal\n\n"
-        "NO — They clearly and explicitly refused, showed hostility, or stated they already have the product:\n"
-        "  - Direct refusal: nahi, no, not interested, nahi chahiye\n"
-        "  - Already have it: pehle se hai, already done, sorted, nahi chahiye, already have mutual funds\n"
-        "  - Hostility: timepass mat karo, scam hai, fraud, bakwas, phone mat karo\n"
-        "  - Explicit dismissal: don't call, koi zaroorat nahi, band karo\n\n"
-        "BUSY — They indicated they can't talk RIGHT NOW but didn't refuse outright:\n"
-        "  - Time constraints: busy hoon, abhi nahi, baad mein, meeting mein hoon\n"
-        "  - Activity: driving, kaam pe hoon, office mein\n"
-        "  - Reschedule request: kal call karo, baad mein karo\n\n"
-        "IMPORTANT: When in doubt, classify as YES. Only classify as NO if the "
-        "refusal is unmistakable.\n\n"
-        f'Customer said: "{user_input}"\n\n'
-        "Classification (one word only — YES, NO, or BUSY):"
-    )
-
-    try:
-        response = await groq_client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=3,
-        )
-        result = response.choices[0].message.content.strip().upper()
-        result = re.sub(r"[^A-Z]", "", result)
-
-        if result in ("YES", "NO", "BUSY"):
-            return result
-        return "YES"  # Benefit of the doubt
-    except Exception as e:
-        logger.error(f"Permission classifier error: {e}")
-        return "YES"
-
-
-async def extract_datetime(user_input: str) -> dict:
-    """
-    Extract scheduling day/time from Hindi/Hinglish/English user input.
-
-    Uses 70B model which natively understands Hindi numbers (paanch=5),
-    Hindi day words (kal=tomorrow), and time expressions (subah=morning).
-    No manual dictionaries. No regex. No fallback parsing.
-    """
-    prompt = (
-        "You are extracting scheduling information from a customer's spoken response "
-        "during a phone call in India.\n\n"
-        "CONTEXT: The AI assistant asked the customer when they'd like a callback. "
-        "The customer responded with the text below.\n\n"
-        "You natively understand:\n"
-        "- Hindi days: kal (tomorrow), parso (day after), aaj (today)\n"
-        "- Hindi times: subah (morning), dopahar (afternoon), sham/shaam (evening), raat (night)\n"
-        "- Hindi numbers with 'baje': ek=1, do=2, teen=3, char=4, paanch=5, "
-        "chhah=6, saat=7, aath=8, nau=9, das=10, gyarah=11, barah=12\n"
-        "- English days: Monday through Sunday\n"
-        "- English times: morning, afternoon, evening, AM, PM\n"
-        "- Hinglish combinations: 'kal 5 baje', 'monday morning', 'parso sham ko'\n\n"
-        "RULES:\n"
-        '1. If the customer mentioned ANY scheduling indicator (a day, time, or both), '
-        "extract it and return JSON.\n"
-        '   - If only time given (e.g., "5 baje"), assume day is "kal".\n'
-        '   - If only day given (e.g., "parso"), set time to "not specified".\n'
-        "2. If the response contains NO scheduling information whatsoever — just filler "
-        'words like "haan", "ok", "theek hai", "ji", "bataiye", unclear sounds, '
-        "or completely unrelated words — return exactly: VAGUE\n\n"
-        "OUTPUT FORMAT (strictly one of these two):\n"
-        '- Schedule found: {"status":"TimeGiven","day":"<day>","time":"<time>"}\n'
-        "- No schedule info: VAGUE\n\n"
-        f'Customer said: "{user_input}"\n\n'
-        "Output:"
-    )
-
-    try:
-        response = await groq_client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=60,
-        )
-        result_text = response.choices[0].message.content.strip()
-
-        # Try to parse JSON from the response
-        match = re.search(r"\{.*?\}", result_text)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-                if data.get("status") == "TimeGiven":
-                    return data
-            except json.JSONDecodeError:
-                pass
-
-        # Model said VAGUE or output was unparseable
-        return {"status": "Vague"}
-
-    except Exception as e:
-        logger.error(f"DateTime extraction error: {e}")
-        return {"status": "Vague"}
-
-
-async def classify_bot_type(category: str) -> str:
-    """
-    Intelligently route a lead to the correct bot based on their category/profession.
-
-    Uses 70B model to understand semantics — e.g. "dentist" → insurance,
-    "chartered accountant" → recruitment. No hardcoded keyword dictionaries.
-    """
-    if not category or not category.strip():
-        return "investment"  # Default when no category info
-
-    prompt = (
-        "You are routing a sales call to the correct AI bot based on the customer's profession/category.\n\n"
-        "We have exactly 3 bots:\n"
-        "- INVESTMENT: For anyone who could benefit from financial planning, mutual funds, SIPs, or wealth management. "
-        "This includes business owners, professionals, salaried individuals, HNIs, etc.\n"
-        "- INSURANCE: For health-related professionals or anyone in the healthcare/medical field "
-        "(doctors, clinics, hospitals, dentists, physiotherapists, etc.) — they need health insurance coverage.\n"
-        "- RECRUITMENT: For existing financial professionals (insurance agents, mutual fund distributors, "
-        "financial advisors, CAs, wealth managers) — we want to recruit them as partners.\n\n"
-        "RULE: When in doubt, classify as INVESTMENT (it's our broadest, most versatile bot).\n\n"
-        f'Customer category: "{category}"\n\n'
-        "Classification (one word only — INVESTMENT, INSURANCE, or RECRUITMENT):"
-    )
-
-    try:
-        response = await groq_client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=3,
-        )
-        result = response.choices[0].message.content.strip().upper()
-        result = re.sub(r"[^A-Z]", "", result)
-
-        bot_map = {"INVESTMENT": "investment", "INSURANCE": "insurance", "RECRUITMENT": "recruitment"}
-        if result in bot_map:
-            logger.info(f"LLM classified category '{category}' → {bot_map[result]}")
-            return bot_map[result]
-        logger.warning(f"LLM returned unexpected bot type '{result}' for category '{category}', defaulting to investment")
-        return "investment"
-    except Exception as e:
-        logger.error(f"Bot type classification error for category '{category}': {e}. Defaulting to investment.")
-        return "investment"  # Safe default
+        # ── HANGUP ───────────────────────────────────────────────────
+        else:
+            return "Wrap up warmly and append [CALL_END]."

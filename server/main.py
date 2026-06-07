@@ -133,8 +133,9 @@ class ChatResponse(BaseModel):
 class MakeCallRequest(BaseModel):
     """Request model for the make-call endpoint."""
     phone: str  # e.g. "9022873952" or "+919022873952"
-    bot_type: str = "riya"  # "riya" (investment) or "aarav" (insurance)
+    bot_type: str = "investment"  # "investment", "insurance", or "recruitment"
     customer_name: Optional[str] = None  # Pass name for personalized calls
+    category: Optional[str] = None  # Pass CRM category for testing the welcome hook
 
 
 class RenewalSummaryResponse(BaseModel):
@@ -598,6 +599,16 @@ async def make_call_exotel(payload: MakeCallRequest):
         "Url": f"http://my.exotel.com/{config.EXOTEL_ACCOUNT_SID}/exoml/start_voice/{config.EXOTEL_APP_ID}",
         "CallType": "trans",
     }
+    
+    # Pass bot_type, customer_name, and category back to us via CustomField
+    custom_params = {"bot_type": payload.bot_type}
+    if payload.customer_name:
+        custom_params["customer_name"] = payload.customer_name
+    if payload.category:
+        custom_params["category"] = payload.category
+    
+    import json
+    form_data["CustomField"] = json.dumps(custom_params)
 
     try:
         response = requests.post(url, data=form_data, timeout=30)
