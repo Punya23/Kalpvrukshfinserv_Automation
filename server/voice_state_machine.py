@@ -30,14 +30,16 @@ CONVERSATION_MODEL = config.LLM_MODEL or "llama-3.3-70b-versatile"
 
 class CallState(Enum):
     VERIFY_NAME      = "VERIFY_NAME"        # Verifying name; waiting for yes or name correction
-    CHECK_PERMISSION = "CHECK_PERMISSION"   # Welcome played; waiting for permission to continue
+    LANGUAGE_CHECK   = "LANGUAGE_CHECK"     # Asking language preference: Hindi or English
+    CHECK_PERMISSION = "CHECK_PERMISSION"   # Hook delivered; waiting for permission to continue
     QUALIFY          = "QUALIFY"            # Discovery and curiosity building
     SCHEDULE         = "SCHEDULE"           # Collecting day + time for Sanjeev sir's callback
     CONFIRM          = "CONFIRM"            # Both day + time received; confirming appointment
     HANGUP           = "HANGUP"             # Final state; call ending
 
 ALLOWED_TRANSITIONS = {
-    "VERIFY_NAME":      {"QUALIFY", "HANGUP"},
+    "VERIFY_NAME":      {"LANGUAGE_CHECK", "HANGUP"},
+    "LANGUAGE_CHECK":   {"CHECK_PERMISSION", "HANGUP"},
     "CHECK_PERMISSION": {"QUALIFY", "HANGUP"},
     "QUALIFY":          {"QUALIFY", "SCHEDULE", "HANGUP"},
     "SCHEDULE":         {"SCHEDULE", "CONFIRM", "HANGUP"},
@@ -132,6 +134,34 @@ async def classify_permission(user_text: str) -> str:
         return "MAYBE"  # Safe default — keeps call alive
 
 
+async def classify_language(user_text: str) -> str:
+    """
+    Classify whether the user prefers Hindi/Hinglish or English.
+    Returns: HINDI or ENGLISH.
+    """
+    prompt = (
+        "The user was asked: 'Hindi mein baat karein ya English mein?'\n"
+        "Based on their response, classify their language preference.\n"
+        "Output exactly one word: HINDI or ENGLISH.\n\n"
+        "HINDI   → They said hindi, haan, ji, theek hai, chalega, Hindi mein, हां, हिंदी, or any affirmative/unclear response\n"
+        "ENGLISH → They explicitly asked for English: english, english please, english mein, angrezi\n\n"
+        "Default: HINDI (if unclear, assume Hindi since this is an Indian market)\n\n"
+        f'User said: "{user_text}"\n\nClassification:'
+    )
+    try:
+        res = await groq_client.chat.completions.create(
+            model=CLASSIFIER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=5,
+        )
+        result = re.sub(r"[^A-Z]", "", res.choices[0].message.content.strip().upper())
+        return result if result in ("HINDI", "ENGLISH") else "HINDI"
+    except Exception as e:
+        logger.error(f"classify_language error: {e}")
+        return "HINDI"  # Safe default for Indian market
+
+
 async def extract_datetime(user_text: str) -> dict:
     """
     Extract appointment day and time from user speech.
@@ -208,6 +238,7 @@ class VoiceStateMachine:
         self.bot_type          = bot_type
         self.customer_name     = customer_name or ""
         self.customer_category = customer_category or ""
+        self.language_preference = "hinglish"  # Default; updated after LANGUAGE_CHECK
         self.scheduled_day     = None
         self.scheduled_time    = None
         self.qualify_turns     = 0   # Turns spent in QUALIFY — gates the scheduling offer
@@ -299,25 +330,68 @@ OUTPUT RULES:
             
         # ── VERIFY_NAME ──────────────────────────────────────────────
         if self.state == CallState.VERIFY_NAME:
-            self.state = CallState.QUALIFY
+            self.state = CallState.LANGUAGE_CHECK
             
             if self.bot_type == "insurance":
-                hook = "agar aaj aapko hospital admit hona pade, to kya aapke paas poora bill cover karne ki coverage hai?"
                 bot_name = "Aarav"
+                gender_form = "bol raha hoon"
             elif self.bot_type == "recruitment":
-                hook = "hum Pune mein selected logo ke saath milkar business expand kar rahe hain. Kya aap hamare saath milkar khudka buisness karna chahte hoo?"
                 bot_name = "Riya"
+                gender_form = "bol rahi hoon"
             else:
-                hook = "kya aap aaj kal apne paison ko badhane ya sahi jagah invest karne ke baare mein soch rahe hain?"
                 bot_name = "Riya"
+                gender_form = "bol rahi hoon"
                 
             return (
                 "The user just responded to your initial 'Namaste'. "
-                f"1. If they confirmed their name, say: 'Main Kalpvruksh Finserv se {bot_name} bol rahi hoon. {hook}'\n"
-                f"2. If they said they are someone else, apologize, use their NEW name warmly, and say: 'Main Kalpvruksh Finserv se {bot_name} bol rahi hoon.  {hook}'\n"
-                f"3. If they asked who is calling, say: 'Main Kalpvruksh Finserv se {bot_name} bol rahi hoon. {hook}'\n"
-                "Do NOT pitch anything else yet. Just state this exact sentence translated naturally to Hinglish."
+                f"Introduce yourself: 'Main Kalpvruksh Finserv se {bot_name} {gender_form}.' "
+                "Then ask their language preference naturally: 'क्या आप Hindi में बात करना prefer करेंगे या English में?' "
+                "If they corrected their name, acknowledge the correction warmly before introducing yourself. "
+                "Do NOT pitch anything yet. Just introduce + ask language."
             )
+
+        # ── LANGUAGE_CHECK ───────────────────────────────────────────
+        if self.state == CallState.LANGUAGE_CHECK:
+            self.state = CallState.CHECK_PERMISSION
+            
+            # Language preference is set by the pipeline before this method is called
+            lang = self.language_preference
+            
+            if lang == "english":
+                lang_instruction = (
+                    "LANGUAGE MODE: The customer chose ENGLISH. "
+                    "Speak in clean, natural English. No Hindi words at all. "
+                    "Keep it warm and conversational, not formal or corporate."
+                )
+            else:  # hinglish (default)
+                lang_instruction = (
+                    "LANGUAGE MODE: The customer chose HINDI. "
+                    "Speak in natural Hinglish — 70% Hindi (Devanagari script), 30% English terms. "
+                    "Hindi words in Devanagari: मैं, आप, अच्छा. English terms in Latin: SIP, insurance, mutual funds."
+                )
+            
+            # Generate the hook based on bot type — LLM creates natural language
+            if self.bot_type == "insurance":
+                hook_instruction = (
+                    "Now deliver your opening hook about healthcare protection. "
+                    "The intent is to make them think about whether their current health coverage "
+                    "is actually sufficient. Ask ONE engaging question. "
+                    "Do NOT use fear-based language. Keep it consultative."
+                )
+            elif self.bot_type == "recruitment":
+                hook_instruction = (
+                    "Now deliver your opening hook about business partnership opportunities. "
+                    "The intent is to create curiosity about an additional income vertical. "
+                    "Ask ONE engaging question about their interest in growing their business."
+                )
+            else:  # investment
+                hook_instruction = (
+                    "Now deliver your opening hook about financial planning. "
+                    "The intent is to make them pause and think about whether their savings "
+                    "will be enough for rising future costs. Ask ONE engaging question."
+                )
+            
+            return f"{lang_instruction}\n\n{hook_instruction}"
 
         # ── CHECK_PERMISSION ─────────────────────────────────────────
         if self.state == CallState.CHECK_PERMISSION:

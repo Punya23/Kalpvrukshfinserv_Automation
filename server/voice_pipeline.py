@@ -10,7 +10,7 @@ import boto3
 from groq import AsyncGroq
 from server.config import config
 from server.audio_utils import pcm_to_mulaw, chunk_pcm
-from server.voice_state_machine import CallState, VoiceStateMachine, classify_permission, extract_datetime, classify_bot_type
+from server.voice_state_machine import CallState, VoiceStateMachine, classify_permission, classify_language, extract_datetime, classify_bot_type
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +218,10 @@ class VoiceConnectionManager:
 
             if self.state_machine.state in (CallState.CHECK_PERMISSION, CallState.QUALIFY):
                 intent = await classify_permission(user_text)
+            elif self.state_machine.state == CallState.LANGUAGE_CHECK:
+                lang = await classify_language(user_text)
+                self.state_machine.language_preference = "english" if lang == "ENGLISH" else "hinglish"
+                logger.info(f"Language preference set to: {self.state_machine.language_preference}")
             elif self.state_machine.state == CallState.SCHEDULE:
                 sched_info = await extract_datetime(user_text)
 
@@ -970,6 +974,10 @@ class ExotelVoiceConnectionManager:
 
             if self.state_machine.state in (CallState.CHECK_PERMISSION, CallState.QUALIFY):
                 intent = await classify_permission(user_text)
+            elif self.state_machine.state == CallState.LANGUAGE_CHECK:
+                lang = await classify_language(user_text)
+                self.state_machine.language_preference = "english" if lang == "ENGLISH" else "hinglish"
+                logger.info(f"[Exotel] Language preference set to: {self.state_machine.language_preference}")
             elif self.state_machine.state == CallState.SCHEDULE:
                 sched_info = await extract_datetime(user_text)
 
