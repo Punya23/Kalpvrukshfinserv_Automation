@@ -221,7 +221,8 @@ class VoiceStateMachine:
         self.scheduled_time    = None
         self.qualify_turns     = 0   # Turns spent in QUALIFY — gates appointment offer
         self.total_turns       = 0   # Hard limit guard
-        self.chat_history      = []
+        self.chat_history      = []  # Trimmed to last 10 msgs for LLM context
+        self.full_transcript   = []  # NEVER trimmed — used for scoring + disk logging
         self._initialize_persona()
 
     def _initialize_persona(self):

@@ -216,6 +216,7 @@ class VoiceConnectionManager:
         try:
             # 1. Update history with the user input
             self.state_machine.chat_history.append({"role": "user", "content": user_text})
+            self.state_machine.full_transcript.append({"role": "user", "content": user_text})
 
             # Keep history manageable — system prompt + last 10 messages
             if len(self.state_machine.chat_history) > 12:
@@ -231,6 +232,7 @@ class VoiceConnectionManager:
             if self.state_machine.state == CallState.HANGUP and instruction.startswith("The call has gone on too long"):
                 bot_text = "माफ़ कीजिएगा, यह call काफी लंबी हो गई है। मैं आपको बाद में कॉल करूँगी। [CALL_END]"
                 self.state_machine.chat_history.append({"role": "assistant", "content": bot_text})
+                self.state_machine.full_transcript.append({"role": "assistant", "content": bot_text})
                 logger.info(f"Bot (Max Turns): {bot_text}")
                 call_is_ending = True
             else:
@@ -260,6 +262,7 @@ class VoiceConnectionManager:
                     "role": "assistant",
                     "content": bot_text
                 })
+                self.state_machine.full_transcript.append({"role": "assistant", "content": bot_text})
                 logger.info(f"Bot: {bot_text}")
 
                 # Post-process: let state machine parse tags and transition
@@ -345,7 +348,7 @@ class VoiceConnectionManager:
 
             # Build transcript
             transcript_lines = []
-            for m in self.state_machine.chat_history:
+            for m in self.state_machine.full_transcript:
                 if m['role'] in ('user', 'assistant'):
                     role = m['role']
                     content = m['content']
@@ -476,6 +479,7 @@ class VoiceConnectionManager:
         clean_welcome = re.sub(r'<[^>]+>', '', clean_welcome)
         clean_welcome = re.sub(r'\s+', ' ', clean_welcome).strip()
         self.state_machine.chat_history.append({"role": "assistant", "content": clean_welcome})
+        self.state_machine.full_transcript.append({"role": "assistant", "content": clean_welcome})
         
         logger.info(f"Welcoming customer directly: {welcome_text}")
         
@@ -942,6 +946,7 @@ class ExotelVoiceConnectionManager:
         clean_welcome = re.sub(r'<[^>]+>', '', clean_welcome)
         clean_welcome = re.sub(r'\s+', ' ', clean_welcome).strip()
         self.state_machine.chat_history.append({"role": "assistant", "content": clean_welcome})
+        self.state_machine.full_transcript.append({"role": "assistant", "content": clean_welcome})
         logger.info(f"[Exotel] Welcoming customer directly: {welcome_text}")
         
         self.is_bot_speaking = True
@@ -977,6 +982,7 @@ class ExotelVoiceConnectionManager:
         try:
             # 1. Update history with the user input
             self.state_machine.chat_history.append({"role": "user", "content": user_text})
+            self.state_machine.full_transcript.append({"role": "user", "content": user_text})
 
             # Keep history manageable — system prompt + last 10 messages
             if len(self.state_machine.chat_history) > 12:
@@ -992,6 +998,7 @@ class ExotelVoiceConnectionManager:
             if self.state_machine.state == CallState.HANGUP and instruction.startswith("The call has gone on too long"):
                 bot_text = "माफ़ कीजिएगा, यह call काफी लंबी हो गई है। मैं आपको बाद में कॉल करूँगी। [CALL_END]"
                 self.state_machine.chat_history.append({"role": "assistant", "content": bot_text})
+                self.state_machine.full_transcript.append({"role": "assistant", "content": bot_text})
                 logger.info(f"[Exotel] Bot (Max Turns): {bot_text}")
                 call_is_ending = True
             else:
@@ -1021,6 +1028,7 @@ class ExotelVoiceConnectionManager:
                     "role": "assistant",
                     "content": bot_text
                 })
+                self.state_machine.full_transcript.append({"role": "assistant", "content": bot_text})
                 logger.info(f"[Exotel] Bot: {bot_text}")
 
                 # Post-process: let state machine parse tags and transition
@@ -1082,7 +1090,7 @@ class ExotelVoiceConnectionManager:
 
             # Build transcript
             transcript_lines = []
-            for m in self.state_machine.chat_history:
+            for m in self.state_machine.full_transcript:
                 if m['role'] in ('user', 'assistant'):
                     role = m['role']
                     content = m['content']
