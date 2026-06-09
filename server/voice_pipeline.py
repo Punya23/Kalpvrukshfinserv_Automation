@@ -22,8 +22,19 @@ polly_client = boto3.client(
     region_name=config.AWS_REGION
 )
 
-# Initialize Groq Client
-groq_client = AsyncGroq(api_key=config.GROQ_API_KEY)
+# Initialize Groq Client with persistent connection pool
+# Without this, each turn creates a new TCP+TLS connection (~4-8s on home WiFi).
+# With this, the first call opens the connection and subsequent calls reuse it (~0ms).
+import httpx as _httpx
+_groq_http_client = _httpx.AsyncClient(
+    limits=_httpx.Limits(
+        max_connections=5,
+        max_keepalive_connections=2,
+        keepalive_expiry=120,       # Keep connection alive for 2 minutes between turns
+    ),
+    timeout=_httpx.Timeout(30.0, connect=10.0),  # 10s connect, 30s total
+)
+groq_client = AsyncGroq(api_key=config.GROQ_API_KEY, http_client=_groq_http_client)
 
 
 class VoiceConnectionManager:
