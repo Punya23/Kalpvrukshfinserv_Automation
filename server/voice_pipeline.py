@@ -74,20 +74,24 @@ class VoiceConnectionManager:
         clean_phone = phone.replace("+", "").replace(" ", "").replace("-", "").strip()
         
         # If no explicit parameter was passed, lookup by phone number in scraped leads database
-        leads_file = Path("data/leads/hni_leads_pune.csv")
-        if leads_file.exists() and clean_phone and not customer_name:
-            try:
-                import csv
-                with open(leads_file, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        row_phone = row.get("phone", "").replace("+", "").replace(" ", "").replace("-", "").strip()
-                        if row_phone and (row_phone in clean_phone or clean_phone in row_phone):
-                            customer_name = row.get("name", "").strip()
-                            customer_category = row.get("category", "").strip()
-                            break
-            except Exception as e:
-                logger.error(f"Error reading leads file: {e}")
+        lead_files = [
+            Path("data/leads/hni_leads_pune.csv"),
+            Path("data/leads/unified_compliant_leads.csv")
+        ]
+        for leads_file in lead_files:
+            if leads_file.exists() and clean_phone and not customer_name:
+                try:
+                    import csv
+                    with open(leads_file, "r", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            row_phone = row.get("phone", "").replace("+", "").replace(" ", "").replace("-", "").strip()
+                            if row_phone and (row_phone in clean_phone or clean_phone in row_phone):
+                                customer_name = row.get("name", "").strip()
+                                customer_category = (row.get("category", "") or row.get("profession", "")).strip()
+                                break
+                except Exception as e:
+                    logger.error(f"Error reading leads file: {e}")
                 
         # Perform LLM classification on category if we have a category
         if customer_category:
@@ -639,20 +643,24 @@ class ExotelVoiceConnectionManager:
         clean_phone = normalize_to_10_digits(phone)
         
         # If no explicit parameter was passed, lookup by phone number in scraped leads database
-        leads_file = Path("data/leads/hni_leads_pune.csv")
-        if leads_file.exists() and clean_phone and not customer_name:
-            try:
-                import csv
-                with open(leads_file, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        row_phone = normalize_to_10_digits(row.get("phone", ""))
-                        if row_phone and row_phone == clean_phone:
-                            customer_name = row.get("name", "").strip()
-                            customer_category = row.get("category", "").strip()
-                            break
-            except Exception as e:
-                logger.error(f"[Exotel] Error reading leads file: {e}")
+        lead_files = [
+            Path("data/leads/hni_leads_pune.csv"),
+            Path("data/leads/unified_compliant_leads.csv")
+        ]
+        for leads_file in lead_files:
+            if leads_file.exists() and clean_phone and not customer_name:
+                try:
+                    import csv
+                    with open(leads_file, "r", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            row_phone = normalize_to_10_digits(row.get("phone", ""))
+                            if row_phone and row_phone == clean_phone:
+                                customer_name = row.get("name", "").strip()
+                                customer_category = (row.get("category", "") or row.get("profession", "")).strip()
+                                break
+                except Exception as e:
+                    logger.error(f"[Exotel] Error reading leads file: {e}")
                 
         # --- CRM Context Extraction for Welcome Message ---
         CATEGORY_MAP = {
