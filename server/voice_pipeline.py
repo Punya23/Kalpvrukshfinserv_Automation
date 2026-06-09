@@ -10,7 +10,7 @@ import boto3
 from groq import AsyncGroq
 from server.config import config
 from server.audio_utils import pcm_to_mulaw, chunk_pcm
-from server.voice_state_machine import CallState, VoiceStateMachine, classify_permission, classify_language, extract_datetime, classify_bot_type
+from server.voice_state_machine import CallState, VoiceStateMachine, classify_bot_type, score_lead_with_llm
 
 logger = logging.getLogger(__name__)
 
@@ -335,14 +335,15 @@ class VoiceConnectionManager:
             self.welcome_interrupted = False
 
     async def _score_and_log_lead(self):
-        """Extract conversation signals, log the scored lead to CRM, and save full transcript (Twilio)."""
+        """LLM-based lead scoring + CRM logging (Twilio)."""
         try:
-            from server.lead_scoring import LeadData, BotType, LeadSource, score_lead
+            from server.lead_scoring import LeadData, BotType, LeadSource, LeadCategory
             from server.sheets_manager import sheets_manager, whatsapp_notifier
 
             if not self.state_machine:
                 return
 
+            # Build transcript
             transcript_lines = []
             for m in self.state_machine.chat_history:
                 if m['role'] in ('user', 'assistant'):
@@ -360,27 +361,31 @@ class VoiceConnectionManager:
             scheduled_day = self.state_machine.scheduled_day
             scheduled_time = self.state_machine.scheduled_time
 
-            if self.state_machine.scheduled_day and self.state_machine.scheduled_time:
+            # Determine outcome from state machine
+            if scheduled_day and scheduled_time:
                 outcome = "callback_scheduled"
-            elif self.state_machine.scheduled_day:
+            elif scheduled_day:
                 outcome = "callback_agreed"
-            elif self.state_machine.state == CallState.HANGUP:
-                outcome = "not_interested"
             else:
-                outcome = "incomplete"
+                outcome = "completed"
 
+            # LLM-based scoring (happens AFTER call, no customer-facing latency)
+            bot_type_str = getattr(self, 'bot_type', 'investment')
+            llm_score = await score_lead_with_llm(transcript, bot_type_str)
+            logger.info(f"[Twilio] LLM Score: {llm_score}")
+
+            # Build LeadData with LLM results
+            category_map = {"HOT": LeadCategory.HOT, "WARM": LeadCategory.WARM, "COLD": LeadCategory.COLD, "DNC": LeadCategory.DNC}
             bot_type_map = {"investment": BotType.INVESTMENT, "insurance": BotType.INSURANCE}
             lead = LeadData(
                 name=getattr(self, 'customer_name', ''),
                 phone=getattr(self, 'caller_phone', ''),
-                conversation_summary=transcript[:500],
+                conversation_summary=llm_score.get("summary", transcript[:500]),
                 source=LeadSource.OUTBOUND_CALL,
-                bot_type=bot_type_map.get(getattr(self, 'bot_type', 'investment'), BotType.INVESTMENT),
-                asked_for_callback=(self.state_machine.state == CallState.CONFIRM),
-                ready_to_buy=(self.state_machine.state == CallState.CONFIRM),
-                said_not_interested=(outcome == "not_interested"),
+                bot_type=bot_type_map.get(bot_type_str, BotType.INVESTMENT),
+                score=llm_score["score"],
+                category=category_map.get(llm_score["category"], LeadCategory.COLD),
             )
-            lead = score_lead(lead)
 
             # Save full transcript to disk
             try:
@@ -391,12 +396,15 @@ class VoiceConnectionManager:
                     "phone": getattr(self, 'caller_phone', ''),
                     "customer_name": getattr(self, 'customer_name', ''),
                     "customer_category": getattr(self, 'customer_category', ''),
-                    "bot_type": getattr(self, 'bot_type', 'investment'),
+                    "bot_type": bot_type_str,
                     "outcome": outcome,
                     "scheduled_day": scheduled_day,
                     "scheduled_time": scheduled_time,
                     "lead_score": lead.score,
                     "lead_category": lead.category.value,
+                    "llm_interest": llm_score.get("interest", ""),
+                    "llm_objection": llm_score.get("objection", ""),
+                    "llm_summary": llm_score.get("summary", ""),
                     "full_transcript": transcript,
                 }
                 log_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{getattr(self, 'caller_phone', 'unknown')[-4:]}.json"
@@ -406,15 +414,15 @@ class VoiceConnectionManager:
             except Exception as e:
                 logger.error(f"[Twilio] Failed to save transcript to disk: {e}")
 
-            if lead.category.value == "HOT":
+            if lead.category == LeadCategory.HOT:
                 sheets_manager.log_hot_lead(lead, scheduled_day=scheduled_day, scheduled_time=scheduled_time)
                 await whatsapp_notifier.notify_manager_hot_lead(lead, scheduled_day=scheduled_day, scheduled_time=scheduled_time)
                 logger.info(f"[Twilio] 🔴 HOT LEAD logged: {lead.name or 'Unknown'} (Score: {lead.score})")
-            elif lead.category.value == "WARM":
+            elif lead.category == LeadCategory.WARM:
                 sheets_manager.log_nurture_lead(lead)
                 logger.info(f"[Twilio] 🟡 WARM LEAD logged: {lead.name or 'Unknown'} (Score: {lead.score})")
             else:
-                logger.info(f"[Twilio] ⚪ COLD/DNC lead: Score {lead.score}")
+                logger.info(f"[Twilio] ⚪ {lead.category.value} lead: Score {lead.score}")
         except Exception as e:
             logger.error(f"[Twilio] Error scoring/logging lead: {e}")
 
@@ -462,7 +470,7 @@ class VoiceConnectionManager:
 
         welcome_text = generate_welcome_message(bot_type, customer_name, getattr(self, "crm_context", {}))
                 
-        self.state_machine.state = CallState.VERIFY_NAME
+        self.state_machine.state = CallState.OPENING
         # Clean SSML tags for chat history
         clean_welcome = welcome_text
         clean_welcome = re.sub(r'<[^>]+>', '', clean_welcome)
@@ -928,7 +936,7 @@ class ExotelVoiceConnectionManager:
 
         welcome_text = generate_welcome_message(bot_type, customer_name, getattr(self, "crm_context", {}))
                 
-        self.state_machine.state = CallState.VERIFY_NAME
+        self.state_machine.state = CallState.OPENING
         # Clean SSML tags for chat history
         clean_welcome = welcome_text
         clean_welcome = re.sub(r'<[^>]+>', '', clean_welcome)
@@ -1067,12 +1075,12 @@ class ExotelVoiceConnectionManager:
             self.welcome_interrupted = False
 
     async def _score_and_log_lead(self):
-        """Extract conversation signals, log the scored lead to CRM, and save full transcript."""
+        """LLM-based lead scoring + CRM logging (Exotel)."""
         try:
-            from server.lead_scoring import LeadData, BotType, LeadSource, score_lead
+            from server.lead_scoring import LeadData, BotType, LeadSource, LeadCategory
             from server.sheets_manager import sheets_manager, whatsapp_notifier
 
-            # Build conversation transcript
+            # Build transcript
             transcript_lines = []
             for m in self.state_machine.chat_history:
                 if m['role'] in ('user', 'assistant'):
@@ -1087,35 +1095,35 @@ class ExotelVoiceConnectionManager:
                     transcript_lines.append(f"{role}: {content}")
             transcript = "\n".join(transcript_lines)
 
-            # Extract scheduled time from state machine
             scheduled_day = self.state_machine.scheduled_day
             scheduled_time = self.state_machine.scheduled_time
 
-            # Determine call outcome
-            if self.state_machine.scheduled_day and self.state_machine.scheduled_time:
+            # Determine outcome
+            if scheduled_day and scheduled_time:
                 outcome = "callback_scheduled"
-            elif self.state_machine.scheduled_day:
+            elif scheduled_day:
                 outcome = "callback_agreed"
-            elif self.state_machine.state == CallState.HANGUP:
-                outcome = "not_interested"
             else:
-                outcome = "incomplete"
+                outcome = "completed"
 
-            # Map bot_type string to BotType enum
+            # LLM-based scoring (happens AFTER call, no customer-facing latency)
+            llm_score = await score_lead_with_llm(transcript, self.bot_type)
+            logger.info(f"[Exotel] LLM Score: {llm_score}")
+
+            # Build LeadData with LLM results
+            category_map = {"HOT": LeadCategory.HOT, "WARM": LeadCategory.WARM, "COLD": LeadCategory.COLD, "DNC": LeadCategory.DNC}
             bot_type_map = {"investment": BotType.INVESTMENT, "insurance": BotType.INSURANCE}
             lead = LeadData(
                 name=self.customer_name,
                 phone=getattr(self, 'caller_phone', ''),
-                conversation_summary=transcript[:500],
+                conversation_summary=llm_score.get("summary", transcript[:500]),
                 source=LeadSource.OUTBOUND_CALL,
                 bot_type=bot_type_map.get(self.bot_type, BotType.INVESTMENT),
-                asked_for_callback=(self.state_machine.state == CallState.CONFIRM),
-                ready_to_buy=(self.state_machine.state == CallState.CONFIRM),
-                said_not_interested=(outcome == "not_interested"),
+                score=llm_score["score"],
+                category=category_map.get(llm_score["category"], LeadCategory.COLD),
             )
-            lead = score_lead(lead)
 
-            # --- Save full transcript to disk ---
+            # Save full transcript to disk
             try:
                 call_log_dir = Path("data/call_logs")
                 call_log_dir.mkdir(parents=True, exist_ok=True)
@@ -1130,6 +1138,9 @@ class ExotelVoiceConnectionManager:
                     "scheduled_time": scheduled_time,
                     "lead_score": lead.score,
                     "lead_category": lead.category.value,
+                    "llm_interest": llm_score.get("interest", ""),
+                    "llm_objection": llm_score.get("objection", ""),
+                    "llm_summary": llm_score.get("summary", ""),
                     "full_transcript": transcript,
                 }
                 log_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{getattr(self, 'caller_phone', 'unknown')[-4:]}.json"
@@ -1139,16 +1150,16 @@ class ExotelVoiceConnectionManager:
             except Exception as e:
                 logger.error(f"[Exotel] Failed to save transcript to disk: {e}")
 
-            # --- Log to CRM + WhatsApp ---
-            if lead.category.value == "HOT":
+            # Log to CRM + WhatsApp
+            if lead.category == LeadCategory.HOT:
                 sheets_manager.log_hot_lead(lead, scheduled_day=scheduled_day, scheduled_time=scheduled_time)
                 await whatsapp_notifier.notify_manager_hot_lead(lead, scheduled_day=scheduled_day, scheduled_time=scheduled_time)
                 logger.info(f"[Exotel] 🔴 HOT LEAD logged: {lead.name or 'Unknown'} (Score: {lead.score})")
-            elif lead.category.value == "WARM":
+            elif lead.category == LeadCategory.WARM:
                 sheets_manager.log_nurture_lead(lead)
                 logger.info(f"[Exotel] 🟡 WARM LEAD logged: {lead.name or 'Unknown'} (Score: {lead.score})")
             else:
-                logger.info(f"[Exotel] ⚪ COLD/DNC lead: Score {lead.score}")
+                logger.info(f"[Exotel] ⚪ {lead.category.value} lead: Score {lead.score}")
         except Exception as e:
             logger.error(f"[Exotel] Error scoring/logging lead: {e}")
 

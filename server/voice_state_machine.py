@@ -5,8 +5,7 @@ Philosophy: Python is the navigator. The LLM is the speaker.
 - State transitions are deterministic Python — never delegated to the LLM.
 - Per-turn situational instructions tell the LLM exactly what situation it is in
   and what its goal is for this turn, without bloating the system prompt.
-- classify_permission() and extract_datetime() are lightweight async classifiers
-  that pre-process user input before the main LLM call.
+- v4: No language selection. No name asking. LLM-based lead scoring.
 """
 
 import re
@@ -29,17 +28,15 @@ CONVERSATION_MODEL = config.LLM_MODEL or "llama-3.3-70b-versatile"
 # ── State Definitions ──────────────────────────────────────────────
 
 class CallState(Enum):
-    VERIFY_NAME      = "VERIFY_NAME"        # Verifying name; waiting for yes or name correction
-    LANGUAGE_CHECK   = "LANGUAGE_CHECK"     # Asking language preference: Hindi or English
-    CHECK_PERMISSION = "CHECK_PERMISSION"   # Hook delivered; waiting for permission to continue
-    QUALIFY          = "QUALIFY"            # Discovery and curiosity building
-    SCHEDULE         = "SCHEDULE"           # Collecting day + time for Sanjeev sir's callback
-    CONFIRM          = "CONFIRM"            # Both day + time received; confirming appointment
-    HANGUP           = "HANGUP"             # Final state; call ending
+    OPENING          = "OPENING"          # Intro + opening hook in ONE turn
+    CHECK_PERMISSION = "CHECK_PERMISSION" # Hook delivered; waiting for permission to continue
+    QUALIFY          = "QUALIFY"           # Discovery and curiosity building
+    SCHEDULE         = "SCHEDULE"          # Collecting day + time for Sanjeev sir's callback
+    CONFIRM          = "CONFIRM"          # Both day + time received; confirming appointment
+    HANGUP           = "HANGUP"           # Final state; call ending
 
 ALLOWED_TRANSITIONS = {
-    "VERIFY_NAME":      {"LANGUAGE_CHECK", "HANGUP"},
-    "LANGUAGE_CHECK":   {"CHECK_PERMISSION", "HANGUP"},
+    "OPENING":          {"CHECK_PERMISSION", "HANGUP"},
     "CHECK_PERMISSION": {"QUALIFY", "HANGUP"},
     "QUALIFY":          {"QUALIFY", "SCHEDULE", "HANGUP"},
     "SCHEDULE":         {"SCHEDULE", "CONFIRM", "HANGUP"},
@@ -102,107 +99,6 @@ def normalize_scheduled_time(time_str: str) -> str | None:
 
 # ── Async LLM Classifiers ──────────────────────────────────────────
 
-async def classify_permission(user_text: str) -> str:
-    """
-    Classify user intent as YES / NO / MAYBE.
-    Used for: permission check (CHECK_PERMISSION state) and
-    scheduling agreement (QUALIFY → SCHEDULE transition).
-
-    YES   = agreement, interest, curiosity, questions (curiosity = soft yes)
-    NO    = clear refusal, go away, remove number, not interested
-    MAYBE = hesitant, busy but not refusing, asking for more info, pushback/skepticism
-    """
-    prompt = (
-        "You are classifying intent from an Indian voice call (Hindi/Hinglish/English).\n"
-        "Output exactly one word: YES, NO, or MAYBE.\n\n"
-        "YES  → agreement, interest, curiosity, willingness, asking questions out of genuine interest\n"
-        "       Examples: haan batao, achha, interesting, tell me more, kya offer hai, ji boliye\n\n"
-        "NO   → HARD refusal, anger, or explicit rejection ONLY:\n"
-        "       Examples: nahi chahiye, not interested, number remove karo, call mat karna,\n"
-        "       timepass mat karo, scam hai, fraud, phone rakh do, bakwaas band karo\n\n"
-        "MAYBE → EVERYTHING ELSE: hesitation, skepticism, defensive questions, pushback,\n"
-        "        busy, confused, asking why you called, challenging your question,\n"
-        "        asking who you are, requesting credentials\n"
-        "        Examples: kya chahiye, kyun pooch rahe ho, kaun bol raha hai,\n"
-        "        abhi busy hoon, baad mein baat karo, socha nahi, dekhenge,\n"
-        "        why are you asking, what is this about, mujhe kaise pata\n\n"
-        "IMPORTANT: If in doubt between NO and MAYBE, always choose MAYBE.\n"
-        "Only use NO for absolutely clear, hostile rejections.\n\n"
-        f'User said: "{user_text}"\n\nClassification:'
-    )
-    try:
-        res = await groq_client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=5,
-        )
-        result = re.sub(r"[^A-Z]", "", res.choices[0].message.content.strip().upper())
-        return result if result in ("YES", "NO", "MAYBE") else "MAYBE"
-    except Exception as e:
-        logger.error(f"classify_permission error: {e}")
-        return "MAYBE"  # Safe default — keeps call alive
-
-
-async def classify_language(user_text: str) -> str:
-    """
-    Classify whether the user prefers Hindi/Hinglish or English.
-    Returns: HINDI or ENGLISH.
-    """
-    prompt = (
-        "The user was asked: 'Hindi mein baat karein ya English mein?'\n"
-        "Based on their response, classify their language preference.\n"
-        "Output exactly one word: HINDI or ENGLISH.\n\n"
-        "HINDI   → They said hindi, haan, ji, theek hai, chalega, Hindi mein, हां, हिंदी, or any affirmative/unclear response\n"
-        "ENGLISH → They explicitly asked for English: english, english please, english mein, angrezi\n\n"
-        "Default: HINDI (if unclear, assume Hindi since this is an Indian market)\n\n"
-        f'User said: "{user_text}"\n\nClassification:'
-    )
-    try:
-        res = await groq_client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=5,
-        )
-        result = re.sub(r"[^A-Z]", "", res.choices[0].message.content.strip().upper())
-        return result if result in ("HINDI", "ENGLISH") else "HINDI"
-    except Exception as e:
-        logger.error(f"classify_language error: {e}")
-        return "HINDI"  # Safe default for Indian market
-
-
-async def extract_datetime(user_text: str) -> dict:
-    """
-    Extract appointment day and time from user speech.
-    Returns: {"day": "YYYY-MM-DD or None", "time": "HH:MM or None"}
-    """
-    prompt = (
-        "Extract appointment scheduling info from this voice call response.\n"
-        "Respond ONLY with valid JSON — no markdown, no explanation.\n\n"
-        '{"day": "<today|tomorrow|day after tomorrow|Monday|...> or null", '
-        '"time": "<5 PM|10:30 AM|2 PM|...> or null"}\n\n'
-        "Extract only what is explicitly mentioned. Null if not mentioned.\n\n"
-        f'User said: "{user_text}"\n\nJSON:'
-    )
-    try:
-        res = await groq_client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=50,
-        )
-        raw = re.sub(r"```json|```", "", res.choices[0].message.content.strip()).strip()
-        parsed = json.loads(raw)
-        return {
-            "day":  normalize_scheduled_date(parsed.get("day")),
-            "time": normalize_scheduled_time(parsed.get("time")),
-        }
-    except Exception as e:
-        logger.error(f"extract_datetime error: {e}")
-        return {"day": None, "time": None}
-
-
 async def classify_bot_type(category: str) -> str:
     """
     Route a lead to the correct bot based on their profession/category.
@@ -233,23 +129,94 @@ async def classify_bot_type(category: str) -> str:
         return "investment"
 
 
+async def score_lead_with_llm(transcript: str, bot_type: str = "investment") -> dict:
+    """
+    LLM-based lead scoring. Called AFTER the call ends (no customer-facing latency).
+    Sends the full transcript to the LLM and gets back a structured score.
+    
+    Returns: {
+        "score": 0-10,
+        "category": "HOT" | "WARM" | "COLD" | "DNC",
+        "interest": "hot" | "warm" | "cold" | "dead",
+        "objection": "none" | "busy" | "has_advisor" | "not_interested" | "send_details",
+        "appointment": "yes" | "no",
+        "summary": "one-line summary of what happened"
+    }
+    """
+    prompt = f"""You are scoring a sales call for a financial advisory firm (Kalpvruksh Finserv, Pune).
+Read the transcript below and output ONLY valid JSON — no markdown, no explanation.
+
+SCORING RULES:
+- Score 8-10 (HOT): Appointment booked, or customer showed strong interest and asked multiple questions, or agreed to a meeting
+- Score 5-7 (WARM): Customer engaged in conversation, asked questions, showed some curiosity, but didn't commit. OR was busy but not hostile. OR said "send details" or "call later"
+- Score 2-4 (COLD): Customer was uninterested but not hostile. Short call, minimal engagement. Said "socha nahi" or "dekhenge" but wasn't rude.
+- Score 0-1 (DNC): Customer explicitly said "remove number", was angry/abusive, or said "call mat karna". Do Not Contact.
+
+IMPORTANT: If the customer ENGAGED in conversation (asked questions, gave responses, discussed their finances), they are AT LEAST WARM (score 5+) even if no appointment was booked.
+A call that ended due to technical issues or latency should be scored WARM (5), not COLD.
+A customer who was curious but hesitant is WARM (5-6), not COLD.
+
+Bot type: {bot_type}
+
+TRANSCRIPT:
+{transcript}
+
+Output JSON:
+{{"score": <0-10>, "category": "<HOT|WARM|COLD|DNC>", "interest": "<hot|warm|cold|dead>", "objection": "<none|busy|has_advisor|not_interested|send_details>", "appointment": "<yes|no>", "summary": "<one line summary>"}}"""
+
+    try:
+        res = await groq_client.chat.completions.create(
+            model=CLASSIFIER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=200,
+        )
+        raw = re.sub(r"```json|```", "", res.choices[0].message.content.strip()).strip()
+        parsed = json.loads(raw)
+        
+        # Validate and clamp score
+        score = max(0, min(10, int(parsed.get("score", 0))))
+        category = parsed.get("category", "COLD").upper()
+        if category not in ("HOT", "WARM", "COLD", "DNC"):
+            category = "COLD"
+        
+        return {
+            "score": score,
+            "category": category,
+            "interest": parsed.get("interest", "cold"),
+            "objection": parsed.get("objection", "none"),
+            "appointment": parsed.get("appointment", "no"),
+            "summary": parsed.get("summary", "")[:200],
+        }
+    except Exception as e:
+        logger.error(f"score_lead_with_llm error: {e}")
+        return {
+            "score": 3,
+            "category": "COLD",
+            "interest": "cold",
+            "objection": "none",
+            "appointment": "no",
+            "summary": "Scoring failed — defaulted to COLD",
+        }
+
+
 class VoiceStateMachine:
     """
     One instance per call. Owns state, chat history, and scheduled appointment.
 
-    v3 — Zero-classifier design:
-    - Language detection: simple keyword match (no LLM needed)
-    - Intent classification: baked into the instruction — the main LLM decides
-    - State transitions: driven by turn count + LLM output tags ([CALL_END], [APPOINTMENT:...])
-    - Result: ONE Groq call per turn instead of TWO → ~2s latency, not ~5s
+    v4 — Production-ready:
+    - NO language selection (always Hinglish)
+    - NO name asking (name from database)
+    - LLM-based lead scoring (post-call)
+    - Intro + hook in ONE turn (saves a full round-trip)
     """
 
     def __init__(self, bot_type: str, customer_name: str = "", customer_category: str = ""):
-        self.state             = CallState.CHECK_PERMISSION
+        self.state             = CallState.OPENING
         self.bot_type          = bot_type
         self.customer_name     = customer_name or ""
         self.customer_category = customer_category or ""
-        self.language_preference = "hinglish"  # Updated by _detect_language
+        self.language_preference = "hinglish"  # Always Hinglish — never changes
         self.scheduled_day     = None
         self.scheduled_time    = None
         self.qualify_turns     = 0   # Turns spent in QUALIFY — gates appointment offer
@@ -281,10 +248,11 @@ class VoiceStateMachine:
             logger.error(f"Failed to read prompt file '{prompt_path}': {e}")
             identity_block = f"You are a warm, helpful {self.bot_type} advisor at Kalpvruksh Finserv, Pune."
 
-        # Name block — let the LLM use judgment; don't force awkward name usage
+        # Name block — explicit that name is KNOWN from database
         if self.customer_name.strip():
             name_block = (
                 f'CUSTOMER NAME FROM DATABASE: "{self.customer_name}"\n'
+                'You already greeted them by name. Do NOT ask for their name again.\n'
                 'If it looks like a category, placeholder, or business term, use "आप" respectfully.'
             )
         else:
@@ -318,21 +286,9 @@ OUTPUT RULES:
 
     # ── Helpers ──────────────────────────────────────────────────────
 
-    def _lang_note(self) -> str:
-        """Return a brief language reminder for injection into every turn instruction."""
-        if self.language_preference == "english":
-            return "(Speak in natural English only — no Hindi.)"
-        return "(Speak in Hinglish — Hindi words in Devanagari, English terms in Latin.)"
-
-    def _detect_language(self, user_text: str):
-        """Simple keyword-based language detection — zero latency, no LLM needed."""
-        english_signals = {"english", "eng", "angrezi", "inglish", "in english"}
-        text_lower = user_text.lower().strip()
-        if any(kw in text_lower for kw in english_signals):
-            self.language_preference = "english"
-        else:
-            self.language_preference = "hinglish"
-        logger.info(f"Language detected from keywords: {self.language_preference}")
+    def _hinglish_note(self) -> str:
+        """Brief Hinglish reminder injected into every turn instruction."""
+        return "(Speak in Hinglish — Hindi words in Devanagari, English financial terms in Latin. NEVER pure Hindi.)"
 
     def post_process_response(self, bot_text: str):
         """
@@ -363,80 +319,54 @@ OUTPUT RULES:
         """
         The core navigator. Called once per turn, before the main LLM call.
 
-        v3 philosophy: Give the LLM ALL conditional paths in ONE instruction.
-        The LLM reads the user's message and picks the right path based on
-        full conversation context. No separate classifier needed.
+        v4 philosophy: No language turn, no name turn. First user response
+        after "Namaste" immediately gets intro + opening hook.
         """
         self.total_turns += 1
-        lang = self._lang_note()
+        lang = self._hinglish_note()
 
         # Hard turn limit — cost control and troll protection
         if self.total_turns >= 15:
             self.state = CallState.HANGUP
-            return f"The call has gone on too long. Thank them genuinely for their time and say goodbye warmly. {lang} Output your [LEAD:...] tag and append [CALL_END]."
+            return f"The call has gone on too long. Thank them genuinely for their time and say goodbye warmly. {lang} Append [CALL_END]."
 
-        # ── VERIFY_NAME ──────────────────────────────────────────────
-        if self.state == CallState.VERIFY_NAME:
-            self.state = CallState.LANGUAGE_CHECK
+        # ── OPENING ─────────────────────────────────────────────────
+        # User just responded to "Namaste Sanjeev ji?" — introduce yourself AND deliver hook in ONE turn
+        if self.state == CallState.OPENING:
+            self.state = CallState.CHECK_PERMISSION
 
             if self.bot_type == "insurance":
                 bot_name = "Aarav"
                 gender_form = "bol raha hoon"
-            elif self.bot_type == "recruitment":
-                bot_name = "Riya"
-                gender_form = "bol rahi hoon"
-            else:
-                bot_name = "Riya"
-                gender_form = "bol rahi hoon"
-
-            return (
-                "The user just responded to your 'Namaste'. "
-                f"Introduce yourself warmly: 'Main Kalpvruksh Finserv se {bot_name} {gender_form}.' "
-                "Then ask their language preference naturally: 'क्या आप Hindi में बात करना prefer करेंगे या English में?' "
-                "If they corrected their name, acknowledge it warmly first. "
-                "Keep it brief — just introduce + ask language. No pitch yet."
-            )
-
-        # ── LANGUAGE_CHECK ───────────────────────────────────────────
-        if self.state == CallState.LANGUAGE_CHECK:
-            # Detect language from user text — instant keyword match
-            self._detect_language(user_text)
-            self.state = CallState.CHECK_PERMISSION
-            lang = self._lang_note()  # Refresh after detection
-
-            if self.language_preference == "english":
-                lang_instruction = (
-                    "LANGUAGE MODE: The customer chose ENGLISH. "
-                    "Speak in clean, natural English. No Hindi at all. Warm and conversational."
-                )
-            else:
-                lang_instruction = (
-                    "LANGUAGE MODE: The customer chose HINDI. "
-                    "Speak in natural Hinglish — Hindi words in Devanagari, English terms in Latin."
-                )
-
-            # Reference the prompt's opening stage
-            if self.bot_type == "insurance":
-                hook_instruction = (
-                    "Now follow your OPENING & DISCOVERY stage (Stage 1 in your prompt). "
+                hook = (
+                    "Then immediately follow your OPENING & DISCOVERY stage. "
                     "Ask one engaging question about their healthcare protection. "
                     "Be consultative, not salesy. Make them think."
                 )
             elif self.bot_type == "recruitment":
-                hook_instruction = (
-                    "Now follow your STAGE 1 — BUSINESS HOOK from your prompt. "
+                bot_name = "Riya"
+                gender_form = "bol rahi hoon"
+                hook = (
+                    "Then immediately follow your STAGE 1 — BUSINESS HOOK. "
                     "Create curiosity about the business partnership opportunity. "
-                    "Generate a fresh, natural opening — don't recite the prompt."
+                    "Generate a fresh, natural opening."
                 )
             else:  # investment
-                hook_instruction = (
-                    "Now follow your S1 — OPENING from your prompt. "
+                bot_name = "Riya"
+                gender_form = "bol rahi hoon"
+                hook = (
+                    "Then immediately follow your S1 — OPENING. "
                     "Make them think about whether their savings strategy is aligned with rising future costs. "
                     "Generate a fresh question — never the same phrasing twice. "
                     "NEVER ask about specific amounts, income, salary, or portfolio value."
                 )
 
-            return f"{lang_instruction}\n\n{hook_instruction}"
+            return (
+                f"The user just responded to your 'Namaste'. {lang} "
+                f"Introduce yourself briefly: 'Main Kalpvruksh Finserv se {bot_name} {gender_form}.' "
+                f"If they corrected their name, acknowledge it warmly first. "
+                f"{hook}"
+            )
 
         # ── CHECK_PERMISSION ─────────────────────────────────────────
         # One turn only — the LLM reads the user's reaction and decides how to proceed
@@ -452,7 +382,7 @@ OUTPUT RULES:
                     "• If they seem confused, hesitant, or said 'not clear' → acknowledge warmly, DON'T repeat the same question. "
                     "Try a completely different, simpler angle. Keep it light.\n"
                     "• If they clearly refused (nahi chahiye, not interested, remove number) → thank them warmly, "
-                    "output your [LEAD:...] tag, and append [CALL_END]."
+                    "append [CALL_END]."
                 )
             elif self.bot_type == "recruitment":
                 return (
@@ -460,7 +390,7 @@ OUTPUT RULES:
                     "Do NOT use their name in this turn.\n\n"
                     "• If they're curious → move to STAGE 2 — QUALIFICATION & PITCH. Ask about their background.\n"
                     "• If hesitant or confused → clarify this isn't MLM or a job. Try a different angle.\n"
-                    "• If clearly refused → thank them warmly, output [LEAD:...] tag, append [CALL_END]."
+                    "• If clearly refused → thank them warmly, append [CALL_END]."
                 )
             else:  # investment
                 return (
@@ -473,7 +403,7 @@ OUTPUT RULES:
                     "• If hesitant or skeptical ('why are you asking?', 'who is this?') → "
                     "follow your OBJECTION HANDLING. Acknowledge warmly. Try a different approach.\n"
                     "• If clearly refused (nahi chahiye, not interested, remove number, scam) → "
-                    "respect their decision. Thank them warmly, output [LEAD:...] tag, append [CALL_END].\n\n"
+                    "respect their decision. Thank them warmly, append [CALL_END].\n\n"
                     "IMPORTANT: Never ask the same question you already asked, even in different words."
                 )
 
@@ -492,7 +422,7 @@ OUTPUT RULES:
                         "• If they're still engaged → follow your MICRO-COMMITMENT stage. "
                         "Offer a free, independent review with संजीव सुराना. If they agree, ask which day works.\n"
                         "• If they pushed back or said no → follow your recovery system. Try one fresh angle.\n"
-                        "• If they clearly refused → output [LEAD:...] tag and [CALL_END]."
+                        "• If they clearly refused → append [CALL_END]."
                     )
                 elif self.bot_type == "recruitment":
                     return (
@@ -501,7 +431,7 @@ OUTPUT RULES:
                         "• If engaged → follow STAGE 4 — APPOINTMENT PITCH. "
                         "Suggest a meeting with Mr Sanjeev Surana. Ask which day works.\n"
                         "• If hesitant → try one more angle from your recovery system.\n"
-                        "• If refused → output [LEAD:...] tag and [CALL_END]."
+                        "• If refused → append [CALL_END]."
                     )
                 else:  # investment
                     return (
@@ -512,7 +442,7 @@ OUTPUT RULES:
                         "Transition naturally to offering a free, short chat with संजीव सुराना. "
                         "If they agree, ask which day works.\n"
                         "• If they pushed back → follow your S3.5 RECOVERY with a fresh angle.\n"
-                        "• If clearly refused → output [LEAD:...] tag and [CALL_END]."
+                        "• If clearly refused → append [CALL_END]."
                     )
 
             # Still in discovery/curiosity building phase
@@ -524,7 +454,7 @@ OUTPUT RULES:
                     "• If they shared something → build on it. Follow your VALUE MOMENT or DISCOVERY stage.\n"
                     "• If they asked a question → answer it directly first, then ask ONE follow-up.\n"
                     "• If hesitant → gently share one relatable insight about health coverage gaps.\n"
-                    "• If they refused → try one recovery angle. If hard refusal → [LEAD:...] + [CALL_END]."
+                    "• If they refused → try one recovery angle. If hard refusal → [CALL_END]."
                 )
             elif self.bot_type == "recruitment":
                 return (
@@ -533,7 +463,7 @@ OUTPUT RULES:
                     "• If engaged → continue STAGE 2 QUALIFICATION. Build on their response.\n"
                     "• If asked a question → answer directly, then ask one follow-up.\n"
                     "• If hesitant → share one insight about the opportunity.\n"
-                    "• If refused → try recovery. Hard refusal → [LEAD:...] + [CALL_END]."
+                    "• If refused → try recovery. Hard refusal → [CALL_END]."
                 )
             else:  # investment
                 return (
@@ -543,7 +473,7 @@ OUTPUT RULES:
                     "• If they shared something → build on it. Follow your S2/S3 — DISCOVERY or CURIOSITY BUILDING.\n"
                     "• If they asked a question → answer it directly first, then ask ONE follow-up.\n"
                     "• If hesitant → follow S3.5 RECOVERY. Try a fresh angle based on what you know about them.\n"
-                    "• If hard refusal (nahi chahiye, remove number) → output [LEAD:...] + [CALL_END].\n\n"
+                    "• If hard refusal (nahi chahiye, remove number) → [CALL_END].\n\n"
                     "IMPORTANT: Never repeat a question you already asked. Build on previous context."
                 )
 
@@ -559,7 +489,7 @@ OUTPUT RULES:
                 "• If they gave only a time → ask which day — today, tomorrow, or another day?\n"
                 "• If they agreed but didn't give day/time → ask warmly when would be convenient.\n"
                 "• If they changed their mind → acknowledge, try one gentle recovery. "
-                "If still no → output [LEAD:...] + [CALL_END].\n\n"
+                "If still no → append [CALL_END].\n\n"
                 "Today is " + datetime.now().strftime("%A, %d %B %Y") + "."
             )
 
@@ -571,9 +501,9 @@ OUTPUT RULES:
                 f"Output: [APPOINTMENT: day={self.scheduled_day}, time={self.scheduled_time}, "
                 f"name={self.customer_name or 'unknown'}] "
                 "Confirm the details warmly, mention that संजीव सुराना will connect with them, "
-                "output your [LEAD:...] tag, and append [CALL_END]."
+                "and append [CALL_END]."
             )
 
         # ── HANGUP ───────────────────────────────────────────────────
         else:
-            return f"The call is ending. Say a warm, genuine goodbye. {lang} Output your [LEAD:...] tag and append [CALL_END]."
+            return f"The call is ending. Say a warm, genuine goodbye. {lang} Append [CALL_END]."
