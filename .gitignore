@@ -29,3 +29,9 @@ patch_*.py
 rewrite_*.py
 test_*.py
 deepgram_stt.py
+
+# Root files & docs backups
+client_secret.json
+implementation_plan.md
+mds/
+n8n/

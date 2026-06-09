@@ -48,19 +48,32 @@ class SheetsManager:
         if not GSPREAD_AVAILABLE:
             return None
 
-        creds_path = Path(config.GOOGLE_SHEETS_CREDENTIALS_FILE)
-        if not creds_path.exists():
-            logger.warning(f"Google credentials file not found: {creds_path}")
-            return None
-
         try:
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
             ]
-            credentials = Credentials.from_service_account_file(str(creds_path), scopes=scopes)
-            self._client = gspread.authorize(credentials)
-            return self._client
+            creds_path = Path(config.GOOGLE_SHEETS_CREDENTIALS_FILE)
+            client_secret_path = Path("client_secret.json")
+            auth_user_path = Path("credentials/authorized_user.json")
+            
+            # Prefer OAuth Client ID if the user generated a token
+            if auth_user_path.exists() and client_secret_path.exists():
+                self._client = gspread.oauth(
+                    credentials_filename=str(client_secret_path),
+                    authorized_user_filename=str(auth_user_path)
+                )
+                return self._client
+                
+            # Fallback to Service Account if the user managed to bypass GCP policy
+            if creds_path.exists():
+                credentials = Credentials.from_service_account_file(str(creds_path), scopes=scopes)
+                self._client = gspread.authorize(credentials)
+                return self._client
+                
+            logger.warning("No Google Sheets credentials found. Need either authorized_user.json or service_account.json")
+            return None
+            
         except Exception as e:
             logger.error(f"Failed to authenticate with Google Sheets: {e}")
             return None
