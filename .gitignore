@@ -1,9 +1,31 @@
+# Environment & Secrets
 .env
+credentials/
+
+# Python
 .venv/
+venv/
 __pycache__/
 *.pyc
-voices_output.json
+*.pyo
 
-data/
+# OS
+.DS_Store
+Thumbs.db
+
+# Audio & Media
 *.mp3
 *.wav
+voices_output.json
+
+# Data (call logs are local-only, leads are committed)
+data/call_logs/
+data/local_sheets/
+data/campaigns/
+
+# Scratch/temp fix scripts
+fix_*.py
+patch_*.py
+rewrite_*.py
+test_*.py
+deepgram_stt.py

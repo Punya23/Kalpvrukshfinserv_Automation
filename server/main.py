@@ -26,6 +26,8 @@ from server.scheduler import renewal_scheduler
 from server.lead_scoring import LeadSource
 from server import call_manager
 from server.voice_pipeline import VoiceConnectionManager, ExotelVoiceConnectionManager
+from server.campaign.campaign_runner import campaign_runner
+from server.campaign.trai_compliance import get_calling_status
 from twilio.rest import Client
 import requests
 
@@ -520,6 +522,69 @@ async def health_check():
             },
         },
     }
+
+
+# -------------------------------------------------------
+# Campaign Automation API
+# -------------------------------------------------------
+
+class StartCampaignRequest(BaseModel):
+    """Request model for starting a calling campaign."""
+    bot_type: str = "investment"  # "investment", "insurance", or "recruitment"
+    csv_path: str = "data/leads/hni_leads_pune.csv"
+    gap_seconds: int = 90  # Seconds between calls
+    max_calls: int = 50
+    enforce_optimal_windows: bool = True  # Only call during 10-12 AM, 3-5 PM
+
+
+@app.post("/api/start-campaign")
+async def start_campaign(request: StartCampaignRequest):
+    """
+    Start an automated calling campaign.
+
+    Reads leads from CSV, deduplicates against call logs,
+    then calls each lead sequentially via Exotel.
+    Enforces TRAI-compliant calling hours (9 AM – 9 PM).
+
+    Body:
+        bot_type: "investment" | "insurance" | "recruitment"
+        csv_path: Path to leads CSV (default: data/leads/hni_leads_pune.csv)
+        gap_seconds: Delay between calls (default: 90)
+        max_calls: Max calls in this campaign (default: 50)
+        enforce_optimal_windows: Only call during golden hours (default: true)
+    """
+    result = await campaign_runner.start(
+        bot_type=request.bot_type,
+        csv_path=request.csv_path,
+        gap_seconds=request.gap_seconds,
+        max_calls=request.max_calls,
+        enforce_optimal_windows=request.enforce_optimal_windows,
+    )
+    status_code = 200 if "error" not in result else 400
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.post("/api/stop-campaign")
+async def stop_campaign():
+    """Stop the currently running campaign after the current call completes."""
+    result = campaign_runner.stop()
+    status_code = 200 if "error" not in result else 400
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.get("/api/campaign-status")
+async def get_campaign_status():
+    """Get current campaign status: progress, results, and calling window info."""
+    return campaign_runner.get_status()
+
+
+@app.get("/api/calling-status")
+async def calling_status():
+    """
+    Check if now is a good time to call.
+    Returns TRAI compliance, optimal window status, and seconds until next window.
+    """
+    return get_calling_status()
 
 
 # -------------------------------------------------------
