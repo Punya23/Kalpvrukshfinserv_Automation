@@ -274,8 +274,8 @@ TTS SCRIPT RULES (Critical for Polly pronunciation):
 - NEVER transliterate Hindi into Latin script (never write "main", "aap", "achha")
 
 OUTPUT RULES:
-- Max 2 sentences, 30 words per turn. One question only. Then stop.
-- NEVER repeat the customer's name during the conversation. Address them by name only at the very start or end. Repeatedly saying their name sounds robotic and irritating.
+- HARD LIMIT: 15-20 words per turn. ONE sentence. ONE question. Then STOP.
+- NEVER repeat the customer's name during the conversation. Name only at start or end.
 - Sound like a smart, caring friend — never a telecaller reading a script.
 - To end call: append [CALL_END] to your final farewell sentence and nowhere else.
 - To confirm appointment: output [APPOINTMENT: day=<YYYY-MM-DD>, time=<HH:MM>, name=<name or unknown>]
@@ -288,8 +288,11 @@ OUTPUT RULES:
     # ── Helpers ──────────────────────────────────────────────────────
 
     def _hinglish_note(self) -> str:
-        """Brief Hinglish reminder injected into every turn instruction."""
-        return "(Speak in Hinglish — Hindi words in Devanagari, English financial terms in Latin. NEVER pure Hindi.)"
+        """Brevity + Hinglish reminder injected into every turn instruction."""
+        return (
+            "(Hinglish only — Hindi in Devanagari, English terms in Latin. "
+            "HARD LIMIT: 1 sentence, 15-20 words. ONE question. Then STOP.)"
+        )
 
     def post_process_response(self, bot_text: str):
         """
@@ -413,7 +416,7 @@ OUTPUT RULES:
             self.qualify_turns += 1
 
             # After 3+ turns of conversation, transition to appointment offer
-            if self.qualify_turns >= 4:
+            if self.qualify_turns >= 3:
                 self.state = CallState.SCHEDULE
                 if self.bot_type == "insurance":
                     return (
@@ -489,6 +492,8 @@ OUTPUT RULES:
                 "• If they gave only a day → ask what time works — morning or evening?\n"
                 "• If they gave only a time → ask which day — today, tomorrow, or another day?\n"
                 "• If they agreed but didn't give day/time → ask warmly when would be convenient.\n"
+                "• If they said 'WhatsApp pe bhej do' or 'send details' or 'message kar do' → "
+                "acknowledge warmly, say you'll send details on WhatsApp, and append [CALL_END].\n"
                 "• If they changed their mind → acknowledge, try one gentle recovery. "
                 "If still no → append [CALL_END].\n\n"
                 "Today is " + datetime.now().strftime("%A, %d %B %Y") + "."
