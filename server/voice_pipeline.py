@@ -213,23 +213,7 @@ class VoiceConnectionManager:
                     + self.state_machine.chat_history[-10:]  # recent context
                 )
 
-            intent = None
-            sched_info = None
-
-            if self.state_machine.state in (CallState.CHECK_PERMISSION, CallState.QUALIFY):
-                intent = await classify_permission(user_text)
-            elif self.state_machine.state == CallState.LANGUAGE_CHECK:
-                lang = await classify_language(user_text)
-                self.state_machine.language_preference = "english" if lang == "ENGLISH" else "hinglish"
-                logger.info(f"Language preference set to: {self.state_machine.language_preference}")
-            elif self.state_machine.state == CallState.SCHEDULE:
-                sched_info = await extract_datetime(user_text)
-
-            instruction = self.state_machine.get_instruction_for_current_state(
-                user_text=user_text,
-                classified_intent=intent,
-                schedule_info=sched_info
-            )
+            instruction = self.state_machine.get_instruction_for_current_state(user_text=user_text)
             
             call_is_ending = False
 
@@ -261,16 +245,14 @@ class VoiceConnectionManager:
                         else:
                             raise  # Let outer except handle it
 
-                # Guard: Strip [CALL_END] if state machine hasn't moved to HANGUP
-                if "[CALL_END]" in bot_text and self.state_machine.state != CallState.HANGUP:
-                    logger.warning(f"LLM spontaneously added [CALL_END] in state {self.state_machine.state.value} — stripping it.")
-                    bot_text = re.sub(r'\[(?:CALL[\s_]*END|END[\s_]*CALL)\]', '', bot_text, flags=re.IGNORECASE).strip()
-                
                 self.state_machine.chat_history.append({
                     "role": "assistant",
                     "content": bot_text
                 })
                 logger.info(f"Bot: {bot_text}")
+
+                # Post-process: let state machine parse tags and transition
+                self.state_machine.post_process_response(bot_text)
 
                 if "[CALL_END]" in bot_text or self.state_machine.state == CallState.HANGUP:
                     call_is_ending = True
@@ -984,23 +966,7 @@ class ExotelVoiceConnectionManager:
                     + self.state_machine.chat_history[-10:]  # recent context
                 )
 
-            intent = None
-            sched_info = None
-
-            if self.state_machine.state in (CallState.CHECK_PERMISSION, CallState.QUALIFY):
-                intent = await classify_permission(user_text)
-            elif self.state_machine.state == CallState.LANGUAGE_CHECK:
-                lang = await classify_language(user_text)
-                self.state_machine.language_preference = "english" if lang == "ENGLISH" else "hinglish"
-                logger.info(f"[Exotel] Language preference set to: {self.state_machine.language_preference}")
-            elif self.state_machine.state == CallState.SCHEDULE:
-                sched_info = await extract_datetime(user_text)
-
-            instruction = self.state_machine.get_instruction_for_current_state(
-                user_text=user_text,
-                classified_intent=intent,
-                schedule_info=sched_info
-            )
+            instruction = self.state_machine.get_instruction_for_current_state(user_text=user_text)
             
             call_is_ending = False
 
@@ -1032,17 +998,14 @@ class ExotelVoiceConnectionManager:
                         else:
                             raise  # Let outer except handle it
 
-                # Guard: Strip [CALL_END] if state machine hasn't moved to HANGUP
-                # Prevents the LLM from unilaterally ending calls
-                if "[CALL_END]" in bot_text and self.state_machine.state != CallState.HANGUP:
-                    logger.warning(f"[Exotel] LLM spontaneously added [CALL_END] in state {self.state_machine.state.value} — stripping it.")
-                    bot_text = re.sub(r'\[(?:CALL[\s_]*END|END[\s_]*CALL)\]', '', bot_text, flags=re.IGNORECASE).strip()
-                
                 self.state_machine.chat_history.append({
                     "role": "assistant",
                     "content": bot_text
                 })
                 logger.info(f"[Exotel] Bot: {bot_text}")
+
+                # Post-process: let state machine parse tags and transition
+                self.state_machine.post_process_response(bot_text)
 
                 if "[CALL_END]" in bot_text or self.state_machine.state == CallState.HANGUP:
                     call_is_ending = True

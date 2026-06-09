@@ -233,14 +233,15 @@ async def classify_bot_type(category: str) -> str:
         return "investment"
 
 
-# ── Core State Machine ─────────────────────────────────────────────
-
 class VoiceStateMachine:
     """
     One instance per call. Owns state, chat history, and scheduled appointment.
 
-    Python drives transitions via get_instruction_for_current_state().
-    The LLM only decides what words to speak — it never controls state.
+    v3 — Zero-classifier design:
+    - Language detection: simple keyword match (no LLM needed)
+    - Intent classification: baked into the instruction — the main LLM decides
+    - State transitions: driven by turn count + LLM output tags ([CALL_END], [APPOINTMENT:...])
+    - Result: ONE Groq call per turn instead of TWO → ~2s latency, not ~5s
     """
 
     def __init__(self, bot_type: str, customer_name: str = "", customer_category: str = ""):
@@ -248,12 +249,10 @@ class VoiceStateMachine:
         self.bot_type          = bot_type
         self.customer_name     = customer_name or ""
         self.customer_category = customer_category or ""
-        self.language_preference = "hinglish"  # Default; updated after LANGUAGE_CHECK
-        self.permission_attempts = 0  # Tracks recovery attempts in CHECK_PERMISSION
+        self.language_preference = "hinglish"  # Updated by _detect_language
         self.scheduled_day     = None
         self.scheduled_time    = None
-        self.qualify_turns     = 0   # Turns spent in QUALIFY — gates the scheduling offer
-        self.recovery_count    = 0   # Consecutive soft refusals in QUALIFY
+        self.qualify_turns     = 0   # Turns spent in QUALIFY — gates appointment offer
         self.total_turns       = 0   # Hard limit guard
         self.chat_history      = []
         self._initialize_persona()
@@ -317,30 +316,56 @@ OUTPUT RULES:
 
         self.chat_history.append({"role": "system", "content": persona})
 
+    # ── Helpers ──────────────────────────────────────────────────────
+
     def _lang_note(self) -> str:
         """Return a brief language reminder for injection into every turn instruction."""
         if self.language_preference == "english":
             return "(Speak in natural English only — no Hindi.)"
         return "(Speak in Hinglish — Hindi words in Devanagari, English terms in Latin.)"
 
-    def _max_recovery(self) -> int:
-        """Max recovery attempts before exit — matches the prompt's recovery system."""
-        if self.bot_type == "investment":
-            return 4   # Investment prompt S3.5 has 4 distinct recovery angles
-        return 3       # Insurance and Recruitment have 3 recovery stages
+    def _detect_language(self, user_text: str):
+        """Simple keyword-based language detection — zero latency, no LLM needed."""
+        english_signals = {"english", "eng", "angrezi", "inglish", "in english"}
+        text_lower = user_text.lower().strip()
+        if any(kw in text_lower for kw in english_signals):
+            self.language_preference = "english"
+        else:
+            self.language_preference = "hinglish"
+        logger.info(f"Language detected from keywords: {self.language_preference}")
 
-    def get_instruction_for_current_state(
-        self,
-        user_text: str,
-        classified_intent: str | None = None,
-        schedule_info: dict | None = None,
-    ) -> str:
+    def post_process_response(self, bot_text: str):
+        """
+        Called AFTER the main LLM responds. Handles state transitions
+        based on tags in the LLM output ([CALL_END], [APPOINTMENT:...]).
+        """
+        # Parse [APPOINTMENT:...] tag if present
+        appointment_match = re.search(
+            r'\[APPOINTMENT:\s*day=([^,\]]+),\s*time=([^,\]]+)',
+            bot_text, re.IGNORECASE
+        )
+        if appointment_match:
+            raw_day = appointment_match.group(1).strip()
+            raw_time = appointment_match.group(2).strip()
+            self.scheduled_day = raw_day
+            self.scheduled_time = normalize_scheduled_time(raw_time) if raw_time else raw_time
+            if self.state not in (CallState.CONFIRM, CallState.HANGUP):
+                self.state = CallState.CONFIRM
+            logger.info(f"Appointment parsed: day={self.scheduled_day}, time={self.scheduled_time}")
+
+        # [CALL_END] → force HANGUP
+        if "[CALL_END]" in bot_text:
+            self.state = CallState.HANGUP
+
+    # ── Core Navigator ──────────────────────────────────────────────
+
+    def get_instruction_for_current_state(self, user_text: str) -> str:
         """
         The core navigator. Called once per turn, before the main LLM call.
 
-        Philosophy: These instructions are director's notes — they tell the LLM
-        what situation it's in and what the goal is, then let the prompt's stage
-        descriptions (S1, S2, S3, etc.) guide the actual words.
+        v3 philosophy: Give the LLM ALL conditional paths in ONE instruction.
+        The LLM reads the user's message and picks the right path based on
+        full conversation context. No separate classifier needed.
         """
         self.total_turns += 1
         lang = self._lang_note()
@@ -348,12 +373,12 @@ OUTPUT RULES:
         # Hard turn limit — cost control and troll protection
         if self.total_turns >= 15:
             self.state = CallState.HANGUP
-            return f"The call has gone on too long. Thank them genuinely for their time and say goodbye warmly. {lang} Append [CALL_END]."
-            
+            return f"The call has gone on too long. Thank them genuinely for their time and say goodbye warmly. {lang} Output your [LEAD:...] tag and append [CALL_END]."
+
         # ── VERIFY_NAME ──────────────────────────────────────────────
         if self.state == CallState.VERIFY_NAME:
             self.state = CallState.LANGUAGE_CHECK
-            
+
             if self.bot_type == "insurance":
                 bot_name = "Aarav"
                 gender_form = "bol raha hoon"
@@ -363,7 +388,7 @@ OUTPUT RULES:
             else:
                 bot_name = "Riya"
                 gender_form = "bol rahi hoon"
-                
+
             return (
                 "The user just responded to your 'Namaste'. "
                 f"Introduce yourself warmly: 'Main Kalpvruksh Finserv se {bot_name} {gender_form}.' "
@@ -374,8 +399,11 @@ OUTPUT RULES:
 
         # ── LANGUAGE_CHECK ───────────────────────────────────────────
         if self.state == CallState.LANGUAGE_CHECK:
+            # Detect language from user text — instant keyword match
+            self._detect_language(user_text)
             self.state = CallState.CHECK_PERMISSION
-            
+            lang = self._lang_note()  # Refresh after detection
+
             if self.language_preference == "english":
                 lang_instruction = (
                     "LANGUAGE MODE: The customer chose ENGLISH. "
@@ -386,8 +414,8 @@ OUTPUT RULES:
                     "LANGUAGE MODE: The customer chose HINDI. "
                     "Speak in natural Hinglish — Hindi words in Devanagari, English terms in Latin."
                 )
-            
-            # Reference the prompt's S1/OPENING stage — let the LLM create the hook
+
+            # Reference the prompt's opening stage
             if self.bot_type == "insurance":
                 hook_instruction = (
                     "Now follow your OPENING & DISCOVERY stage (Stage 1 in your prompt). "
@@ -407,245 +435,133 @@ OUTPUT RULES:
                     "Generate a fresh question — never the same phrasing twice. "
                     "NEVER ask about specific amounts, income, salary, or portfolio value."
                 )
-            
+
             return f"{lang_instruction}\n\n{hook_instruction}"
 
         # ── CHECK_PERMISSION ─────────────────────────────────────────
+        # One turn only — the LLM reads the user's reaction and decides how to proceed
         if self.state == CallState.CHECK_PERMISSION:
-            if classified_intent == "YES":
-                self.permission_attempts = 0
-                self.state = CallState.QUALIFY
-                if self.bot_type == "insurance":
-                    return (
-                        f"They engaged with your opening hook. {lang} "
-                        "Follow your DISCOVERY stage — understand their current coverage situation. "
-                        "Ask one open question to learn if they have a policy, corporate cover, or nothing. "
-                        "Listen more than you talk."
-                    )
-                elif self.bot_type == "recruitment":
-                    return (
-                        f"They're curious. {lang} "
-                        "Move to your STAGE 2 — QUALIFICATION & PITCH. "
-                        "Match the pitch to their profession if you know it. "
-                        "Ask one question to understand their background."
-                    )
-                else:  # investment
-                    return (
-                        f"They engaged positively. {lang} "
-                        "Follow your S2 — DISCOVERY. Understand how they manage their finances. "
-                        "Do they handle it themselves? Have existing investments? "
-                        "Ask one open question. Don't pitch yet."
-                    )
-            elif classified_intent == "NO":
-                self.permission_attempts += 1
-                if self.permission_attempts >= 2:
-                    # Second refusal → respect and exit
-                    self.state = CallState.HANGUP
-                    return (
-                        f"They've refused twice. Respect their decision. {lang} "
-                        "Thank them warmly for their time. "
-                        "Output your [LEAD:...] tag with interest=dead, then append [CALL_END]."
-                    )
-                # First refusal → one recovery attempt (prompt says 'never exit on first refusal')
-                if self.bot_type == "insurance":
-                    return (
-                        f"They pushed back on the opening. That's fine — don't take it personally. {lang} "
-                        "Acknowledge their reaction warmly. Try a completely different angle: "
-                        "mention that most people haven't reviewed their health coverage in years and "
-                        "you just had a quick question. Keep it light and zero-pressure."
-                    )
-                elif self.bot_type == "recruitment":
-                    return (
-                        f"They weren't interested in the opening pitch. No problem. {lang} "
-                        "Acknowledge naturally and try ONE different angle: "
-                        "clarify this isn't a job or MLM — it's a partnership model. "
-                        "Ask if they'd be open to just hearing one line about it."
-                    )
-                else:  # investment
-                    return (
-                        f"They pushed back or seem skeptical. That's normal. {lang} "
-                        "Follow your OBJECTION HANDLING from the prompt. "
-                        "Acknowledge their reaction warmly. Don't repeat the same hook. "
-                        "Try a different angle — maybe mention that you just had a quick question, "
-                        "no sales pitch, no product push. Keep it conversational."
-                    )
-            else:  # MAYBE
-                self.permission_attempts += 1
-                if self.permission_attempts >= 3:
-                    # After 3 MAYBE attempts, they're clearly not engaging
-                    self.state = CallState.HANGUP
-                    return (
-                        f"They've been hesitant multiple times. Respect their space. {lang} "
-                        "Thank them warmly and offer to call another time. "
-                        "Output your [LEAD:...] tag with interest=cold, then append [CALL_END]."
-                    )
-                if self.bot_type == "insurance":
-                    return (
-                        f"They seem hesitant — not a no, not a yes. {lang} "
-                        "Don't pitch. Just ask for one minute of their time. "
-                        "Mention that you have a quick question about their family's health protection."
-                    )
-                elif self.bot_type == "recruitment":
-                    return (
-                        f"They're unsure. {lang} "
-                        "Don't push. Just say you have a quick question about business opportunities in their area. "
-                        "Ask for just two minutes."
-                    )
-                else:
-                    return (
-                        f"They're hesitant but didn't refuse. {lang} "
-                        "Acknowledge warmly. Make one gentle attempt — mention it's just a quick question "
-                        "about making their savings work harder. Ask for two minutes."
-                    )
+            self.state = CallState.QUALIFY  # Optimistic advance
+
+            if self.bot_type == "insurance":
+                return (
+                    f"The user just responded to your opening hook. Read their response carefully. {lang} "
+                    "Do NOT use their name in this turn.\n\n"
+                    "• If they engaged, asked questions, or showed curiosity → follow your DISCOVERY stage. "
+                    "Ask one open question about their current health coverage.\n"
+                    "• If they seem confused, hesitant, or said 'not clear' → acknowledge warmly, DON'T repeat the same question. "
+                    "Try a completely different, simpler angle. Keep it light.\n"
+                    "• If they clearly refused (nahi chahiye, not interested, remove number) → thank them warmly, "
+                    "output your [LEAD:...] tag, and append [CALL_END]."
+                )
+            elif self.bot_type == "recruitment":
+                return (
+                    f"The user just responded to your opening hook. Read their response carefully. {lang} "
+                    "Do NOT use their name in this turn.\n\n"
+                    "• If they're curious → move to STAGE 2 — QUALIFICATION & PITCH. Ask about their background.\n"
+                    "• If hesitant or confused → clarify this isn't MLM or a job. Try a different angle.\n"
+                    "• If clearly refused → thank them warmly, output [LEAD:...] tag, append [CALL_END]."
+                )
+            else:  # investment
+                return (
+                    f"The user just responded to your opening hook. Read their response carefully. {lang} "
+                    "Do NOT use their name in this turn.\n\n"
+                    "• If they engaged, asked questions, or showed interest → follow your S2 — DISCOVERY. "
+                    "Understand how they manage finances. Ask one open question. Don't pitch yet.\n"
+                    "• If they seem confused ('not clear', 'repeat', 'what?') → acknowledge warmly. "
+                    "DON'T rephrase the same question. Try a completely different, simpler angle.\n"
+                    "• If hesitant or skeptical ('why are you asking?', 'who is this?') → "
+                    "follow your OBJECTION HANDLING. Acknowledge warmly. Try a different approach.\n"
+                    "• If clearly refused (nahi chahiye, not interested, remove number, scam) → "
+                    "respect their decision. Thank them warmly, output [LEAD:...] tag, append [CALL_END].\n\n"
+                    "IMPORTANT: Never ask the same question you already asked, even in different words."
+                )
 
         # ── QUALIFY ──────────────────────────────────────────────────
         elif self.state == CallState.QUALIFY:
-            max_recovery = self._max_recovery()
-            
-            if classified_intent == "YES":
-                self.recovery_count = 0
-                self.qualify_turns += 1
-                
-                # Require at least 3 qualify turns before offering the consultation
-                # This matches the prompt rule: "at least 3 organic conversational turns"
-                if self.qualify_turns >= 3:
-                    self.state = CallState.SCHEDULE
-                    if self.bot_type == "insurance":
-                        return (
-                            f"The conversation has been good — they're engaged. {lang} "
-                            "Follow your MICRO-COMMITMENT stage (Stage 6). "
-                            "Offer the independent review framing first, then if they agree, "
-                            "suggest scheduling with संजीव सुराना. Low-pressure transition."
-                        )
-                    elif self.bot_type == "recruitment":
-                        return (
-                            f"They're genuinely interested after good conversation. {lang} "
-                            "Follow your STAGE 4 — APPOINTMENT PITCH. "
-                            "Transition naturally to suggesting a meeting with Mr Sanjeev Surana. "
-                            "Frame it as a partnership briefing, not a sales pitch."
-                        )
-                    else:  # investment
-                        return (
-                            f"Great discovery conversation. {lang} "
-                            "Follow your S5 — APPOINTMENT OFFER. "
-                            "Transition naturally to offering a free, short conversation with संजीव सुराना. "
-                            "Generate a warm bridge — never make it sound transactional."
-                        )
-                
-                # Still building — reference the appropriate prompt stage
+            self.qualify_turns += 1
+
+            # After 3+ turns of conversation, transition to appointment offer
+            if self.qualify_turns >= 4:
+                self.state = CallState.SCHEDULE
                 if self.bot_type == "insurance":
                     return (
-                        f"Conversation flowing well (turn {self.qualify_turns}/3). {lang} "
-                        "Follow your VALUE MOMENT or DISCOVERY stage. "
-                        "Build on what they just shared. Ask one follow-up to go deeper. "
-                        "If they mentioned a specific concern, explore it."
+                        f"The conversation has been going well. {lang} "
+                        "Do NOT use their name.\n\n"
+                        "Read the user's last message:\n"
+                        "• If they're still engaged → follow your MICRO-COMMITMENT stage. "
+                        "Offer a free, independent review with संजीव सुराना. If they agree, ask which day works.\n"
+                        "• If they pushed back or said no → follow your recovery system. Try one fresh angle.\n"
+                        "• If they clearly refused → output [LEAD:...] tag and [CALL_END]."
                     )
                 elif self.bot_type == "recruitment":
                     return (
-                        f"They're engaged (turn {self.qualify_turns}/3). {lang} "
-                        "Continue your STAGE 2 — QUALIFICATION. "
-                        "Build on their response. Share one relevant insight about the opportunity "
-                        "and ask one question to understand their interest level better."
+                        f"Good conversation so far. {lang} "
+                        "Do NOT use their name.\n\n"
+                        "• If engaged → follow STAGE 4 — APPOINTMENT PITCH. "
+                        "Suggest a meeting with Mr Sanjeev Surana. Ask which day works.\n"
+                        "• If hesitant → try one more angle from your recovery system.\n"
+                        "• If refused → output [LEAD:...] tag and [CALL_END]."
                     )
                 else:  # investment
                     return (
-                        f"Discovery going well (turn {self.qualify_turns}/3). {lang} "
-                        "Follow your S2/S3 — DISCOVERY or CURIOSITY BUILDING. "
-                        "Build on what they shared. Surface a blind spot or share a relatable insight. "
-                        "Ask one follow-up that makes them think. Don't rush."
+                        f"Great conversation so far. {lang} "
+                        "Do NOT use their name.\n\n"
+                        "Read the user's last message:\n"
+                        "• If they're engaged → follow your S5 — APPOINTMENT OFFER. "
+                        "Transition naturally to offering a free, short chat with संजीव सुराना. "
+                        "If they agree, ask which day works.\n"
+                        "• If they pushed back → follow your S3.5 RECOVERY with a fresh angle.\n"
+                        "• If clearly refused → output [LEAD:...] tag and [CALL_END]."
                     )
-                    
-            elif classified_intent == "NO":
-                self.recovery_count += 1
-                if self.recovery_count >= max_recovery:
-                    self.state = CallState.HANGUP
-                    return (
-                        f"You've tried {max_recovery} recovery angles and they're still not interested. {lang} "
-                        "Respect their decision. Thank them sincerely for their time. "
-                        "Output your [LEAD:...] tag with the right status, then append [CALL_END]."
-                    )
-                
-                # Reference the prompt's recovery system with specific angle guidance
-                if self.bot_type == "insurance":
-                    recovery_angles = [
-                        "Follow your R1 recovery — mention that most people haven't reviewed their policy in years.",
-                        "Follow your R2 recovery — connect to changing family responsibilities.",
-                        "Follow your R3 recovery — frame it as an independent review with no obligations. Offer WhatsApp follow-up.",
-                    ]
-                elif self.bot_type == "recruitment":
-                    recovery_angles = [
-                        "Follow your STAGE 3 Attempt 1 — normalize their hesitation, mention recurring income model.",
-                        "Follow your STAGE 3 Attempt 2 — clarify this isn't MLM or a job. It's a franchise model.",
-                        "Follow your STAGE 3 Attempt 3 — last try. If still no, exit warmly.",
-                    ]
-                else:  # investment — 4 recovery angles
-                    recovery_angles = [
-                        "Follow your S3.5 Attempt 1 — normalize hesitation. Busy professionals often delay reviews.",
-                        "Follow your S3.5 Attempt 2 — connect to a concrete milestone: children's education, home, retirement.",
-                        "Follow your S3.5 Attempt 3 — social proof. Others in Pune found one conversation useful.",
-                        "Follow your S3.5 Attempt 4 — zero-pressure framing. Free, short, no product push.",
-                    ]
-                
-                angle_idx = min(self.recovery_count - 1, len(recovery_angles) - 1)
+
+            # Still in discovery/curiosity building phase
+            if self.bot_type == "insurance":
                 return (
-                    f"Soft refusal — recovery attempt {self.recovery_count}/{max_recovery}. {lang} "
-                    f"{recovery_angles[angle_idx]} "
-                    "Generate completely fresh language. Never repeat what you already said."
+                    f"Continue the conversation naturally (turn {self.qualify_turns}/3 before appointment offer). {lang} "
+                    "Do NOT use their name.\n\n"
+                    "Read the user's last message:\n"
+                    "• If they shared something → build on it. Follow your VALUE MOMENT or DISCOVERY stage.\n"
+                    "• If they asked a question → answer it directly first, then ask ONE follow-up.\n"
+                    "• If hesitant → gently share one relatable insight about health coverage gaps.\n"
+                    "• If they refused → try one recovery angle. If hard refusal → [LEAD:...] + [CALL_END]."
                 )
-                
-            else:  # MAYBE
-                if self.bot_type == "insurance":
-                    return (
-                        f"They're on the fence — not refusing, not agreeing. {lang} "
-                        "Gently acknowledge their hesitation. Share one brief, relatable point "
-                        "about how quickly medical costs are rising. Ask one soft follow-up."
-                    )
-                elif self.bot_type == "recruitment":
-                    return (
-                        f"They're thinking about it. {lang} "
-                        "Don't push. Acknowledge naturally and share one small insight "
-                        "about what professionals in similar roles are doing. Ask one gentle question."
-                    )
-                else:
-                    return (
-                        f"They're uncertain but still on the call. {lang} "
-                        "Validate their hesitation empathetically. Share one brief relatable insight "
-                        "based on what they've shared so far. Ask one gentle follow-up to keep them talking."
-                    )
+            elif self.bot_type == "recruitment":
+                return (
+                    f"Continue building rapport (turn {self.qualify_turns}/3). {lang} "
+                    "Do NOT use their name.\n\n"
+                    "• If engaged → continue STAGE 2 QUALIFICATION. Build on their response.\n"
+                    "• If asked a question → answer directly, then ask one follow-up.\n"
+                    "• If hesitant → share one insight about the opportunity.\n"
+                    "• If refused → try recovery. Hard refusal → [LEAD:...] + [CALL_END]."
+                )
+            else:  # investment
+                return (
+                    f"Continue discovery naturally (turn {self.qualify_turns}/3 before appointment offer). {lang} "
+                    "Do NOT use their name.\n\n"
+                    "Read the user's last message:\n"
+                    "• If they shared something → build on it. Follow your S2/S3 — DISCOVERY or CURIOSITY BUILDING.\n"
+                    "• If they asked a question → answer it directly first, then ask ONE follow-up.\n"
+                    "• If hesitant → follow S3.5 RECOVERY. Try a fresh angle based on what you know about them.\n"
+                    "• If hard refusal (nahi chahiye, remove number) → output [LEAD:...] + [CALL_END].\n\n"
+                    "IMPORTANT: Never repeat a question you already asked. Build on previous context."
+                )
 
         # ── SCHEDULE ─────────────────────────────────────────────────
         elif self.state == CallState.SCHEDULE:
-            day  = (schedule_info or {}).get("day")
-            time = (schedule_info or {}).get("time")
-
-            if day:
-                self.scheduled_day = day
-            if time:
-                self.scheduled_time = time
-
-            if self.scheduled_day and self.scheduled_time:
-                self.state = CallState.CONFIRM
-                return (
-                    f"Both day ({self.scheduled_day}) and time ({self.scheduled_time}) confirmed. {lang} "
-                    f"Output: [APPOINTMENT: day={self.scheduled_day}, time={self.scheduled_time}, "
-                    f"name={self.customer_name or 'unknown'}] "
-                    "Then confirm warmly and append [CALL_END]."
-                )
-            elif self.scheduled_day and not self.scheduled_time:
-                return (
-                    f"Day is set ({self.scheduled_day}) but no time yet. {lang} "
-                    "Ask naturally what time works best for them — morning or afternoon/evening."
-                )
-            elif self.scheduled_time and not self.scheduled_day:
-                return (
-                    f"Time is set ({self.scheduled_time}) but no day yet. {lang} "
-                    "Ask naturally which day works — today, tomorrow, or another day."
-                )
-            else:
-                return (
-                    f"They agreed to the meeting but haven't given day or time. {lang} "
-                    "Ask warmly: which day and time would be convenient for them?"
-                )
+            return (
+                f"You're scheduling a meeting with संजीव सुराना. {lang} "
+                "Do NOT use their name.\n\n"
+                "Read the user's last message:\n"
+                "• If they gave a day and time → output: [APPOINTMENT: day=<YYYY-MM-DD>, time=<HH:MM>, "
+                f"name={self.customer_name or 'unknown'}] then confirm warmly and append [CALL_END].\n"
+                "• If they gave only a day → ask what time works — morning or evening?\n"
+                "• If they gave only a time → ask which day — today, tomorrow, or another day?\n"
+                "• If they agreed but didn't give day/time → ask warmly when would be convenient.\n"
+                "• If they changed their mind → acknowledge, try one gentle recovery. "
+                "If still no → output [LEAD:...] + [CALL_END].\n\n"
+                "Today is " + datetime.now().strftime("%A, %d %B %Y") + "."
+            )
 
         # ── CONFIRM ──────────────────────────────────────────────────
         elif self.state == CallState.CONFIRM:
