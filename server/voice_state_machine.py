@@ -110,14 +110,24 @@ async def classify_permission(user_text: str) -> str:
 
     YES   = agreement, interest, curiosity, questions (curiosity = soft yes)
     NO    = clear refusal, go away, remove number, not interested
-    MAYBE = hesitant, busy but not refusing, asking for more info
+    MAYBE = hesitant, busy but not refusing, asking for more info, pushback/skepticism
     """
     prompt = (
-        "You are classifying intent from a voice call.\n"
+        "You are classifying intent from an Indian voice call (Hindi/Hinglish/English).\n"
         "Output exactly one word: YES, NO, or MAYBE.\n\n"
-        "YES  → agreement, interest, curiosity, willingness, questions (questions = interest)\n"
-        "NO   → They clearly refused the pitch or showed hostility: nahi, no, not interested, timepass mat karo, scam hai, fraud\n"
-        "MAYBE → hesitant, busy, unclear, asking for more info before deciding\n\n"
+        "YES  → agreement, interest, curiosity, willingness, asking questions out of genuine interest\n"
+        "       Examples: haan batao, achha, interesting, tell me more, kya offer hai, ji boliye\n\n"
+        "NO   → HARD refusal, anger, or explicit rejection ONLY:\n"
+        "       Examples: nahi chahiye, not interested, number remove karo, call mat karna,\n"
+        "       timepass mat karo, scam hai, fraud, phone rakh do, bakwaas band karo\n\n"
+        "MAYBE → EVERYTHING ELSE: hesitation, skepticism, defensive questions, pushback,\n"
+        "        busy, confused, asking why you called, challenging your question,\n"
+        "        asking who you are, requesting credentials\n"
+        "        Examples: kya chahiye, kyun pooch rahe ho, kaun bol raha hai,\n"
+        "        abhi busy hoon, baad mein baat karo, socha nahi, dekhenge,\n"
+        "        why are you asking, what is this about, mujhe kaise pata\n\n"
+        "IMPORTANT: If in doubt between NO and MAYBE, always choose MAYBE.\n"
+        "Only use NO for absolutely clear, hostile rejections.\n\n"
         f'User said: "{user_text}"\n\nClassification:'
     )
     try:
@@ -239,6 +249,7 @@ class VoiceStateMachine:
         self.customer_name     = customer_name or ""
         self.customer_category = customer_category or ""
         self.language_preference = "hinglish"  # Default; updated after LANGUAGE_CHECK
+        self.permission_attempts = 0  # Tracks recovery attempts in CHECK_PERMISSION
         self.scheduled_day     = None
         self.scheduled_time    = None
         self.qualify_turns     = 0   # Turns spent in QUALIFY — gates the scheduling offer
@@ -392,8 +403,9 @@ OUTPUT RULES:
             else:  # investment
                 hook_instruction = (
                     "Now follow your S1 — OPENING from your prompt. "
-                    "Make them pause and think about whether their savings are enough for the future. "
-                    "Generate a fresh question — never the same phrasing twice."
+                    "Make them think about whether their savings strategy is aligned with rising future costs. "
+                    "Generate a fresh question — never the same phrasing twice. "
+                    "NEVER ask about specific amounts, income, salary, or portfolio value."
                 )
             
             return f"{lang_instruction}\n\n{hook_instruction}"
@@ -401,6 +413,7 @@ OUTPUT RULES:
         # ── CHECK_PERMISSION ─────────────────────────────────────────
         if self.state == CallState.CHECK_PERMISSION:
             if classified_intent == "YES":
+                self.permission_attempts = 0
                 self.state = CallState.QUALIFY
                 if self.bot_type == "insurance":
                     return (
@@ -424,13 +437,48 @@ OUTPUT RULES:
                         "Ask one open question. Don't pitch yet."
                     )
             elif classified_intent == "NO":
-                self.state = CallState.HANGUP
-                return (
-                    f"They clearly don't want to continue. {lang} "
-                    "Respect their decision gracefully. Thank them and say goodbye warmly. "
-                    "Output your [LEAD:...] tag with interest=dead, then append [CALL_END]."
-                )
+                self.permission_attempts += 1
+                if self.permission_attempts >= 2:
+                    # Second refusal → respect and exit
+                    self.state = CallState.HANGUP
+                    return (
+                        f"They've refused twice. Respect their decision. {lang} "
+                        "Thank them warmly for their time. "
+                        "Output your [LEAD:...] tag with interest=dead, then append [CALL_END]."
+                    )
+                # First refusal → one recovery attempt (prompt says 'never exit on first refusal')
+                if self.bot_type == "insurance":
+                    return (
+                        f"They pushed back on the opening. That's fine — don't take it personally. {lang} "
+                        "Acknowledge their reaction warmly. Try a completely different angle: "
+                        "mention that most people haven't reviewed their health coverage in years and "
+                        "you just had a quick question. Keep it light and zero-pressure."
+                    )
+                elif self.bot_type == "recruitment":
+                    return (
+                        f"They weren't interested in the opening pitch. No problem. {lang} "
+                        "Acknowledge naturally and try ONE different angle: "
+                        "clarify this isn't a job or MLM — it's a partnership model. "
+                        "Ask if they'd be open to just hearing one line about it."
+                    )
+                else:  # investment
+                    return (
+                        f"They pushed back or seem skeptical. That's normal. {lang} "
+                        "Follow your OBJECTION HANDLING from the prompt. "
+                        "Acknowledge their reaction warmly. Don't repeat the same hook. "
+                        "Try a different angle — maybe mention that you just had a quick question, "
+                        "no sales pitch, no product push. Keep it conversational."
+                    )
             else:  # MAYBE
+                self.permission_attempts += 1
+                if self.permission_attempts >= 3:
+                    # After 3 MAYBE attempts, they're clearly not engaging
+                    self.state = CallState.HANGUP
+                    return (
+                        f"They've been hesitant multiple times. Respect their space. {lang} "
+                        "Thank them warmly and offer to call another time. "
+                        "Output your [LEAD:...] tag with interest=cold, then append [CALL_END]."
+                    )
                 if self.bot_type == "insurance":
                     return (
                         f"They seem hesitant — not a no, not a yes. {lang} "

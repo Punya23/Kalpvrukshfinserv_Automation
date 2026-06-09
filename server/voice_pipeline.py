@@ -233,7 +233,7 @@ class VoiceConnectionManager:
             
             call_is_ending = False
 
-            if self.state_machine.state == CallState.HANGUP and instruction.startswith("The call has reached its limit"):
+            if self.state_machine.state == CallState.HANGUP and instruction.startswith("The call has gone on too long"):
                 bot_text = "माफ़ कीजिएगा, यह call काफी लंबी हो गई है। मैं आपको बाद में कॉल करूँगी। [CALL_END]"
                 self.state_machine.chat_history.append({"role": "assistant", "content": bot_text})
                 logger.info(f"Bot (Max Turns): {bot_text}")
@@ -242,14 +242,29 @@ class VoiceConnectionManager:
                 messages = list(self.state_machine.chat_history)
                 messages.append({"role": "system", "content": instruction})
 
-                # 2. Get LLM Response from Groq (Plain text)
-                response = await groq_client.chat.completions.create(
-                    model=config.LLM_MODEL or "llama-3.3-70b-versatile",
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=150
-                )
-                bot_text = response.choices[0].message.content.strip()
+                # 2. Get LLM Response from Groq (with 1 retry on transient errors)
+                bot_text = None
+                for attempt in range(2):
+                    try:
+                        response = await groq_client.chat.completions.create(
+                            model=config.LLM_MODEL or "llama-3.3-70b-versatile",
+                            messages=messages,
+                            temperature=0.3,
+                            max_tokens=150
+                        )
+                        bot_text = response.choices[0].message.content.strip()
+                        break  # Success
+                    except Exception as llm_err:
+                        if attempt == 0:
+                            logger.warning(f"LLM attempt 1 failed: {llm_err}. Retrying in 1s...")
+                            await asyncio.sleep(1.0)
+                        else:
+                            raise  # Let outer except handle it
+
+                # Guard: Strip [CALL_END] if state machine hasn't moved to HANGUP
+                if "[CALL_END]" in bot_text and self.state_machine.state != CallState.HANGUP:
+                    logger.warning(f"LLM spontaneously added [CALL_END] in state {self.state_machine.state.value} — stripping it.")
+                    bot_text = re.sub(r'\[(?:CALL[\s_]*END|END[\s_]*CALL)\]', '', bot_text, flags=re.IGNORECASE).strip()
                 
                 self.state_machine.chat_history.append({
                     "role": "assistant",
@@ -989,7 +1004,7 @@ class ExotelVoiceConnectionManager:
             
             call_is_ending = False
 
-            if self.state_machine.state == CallState.HANGUP and instruction.startswith("The call has reached its limit"):
+            if self.state_machine.state == CallState.HANGUP and instruction.startswith("The call has gone on too long"):
                 bot_text = "माफ़ कीजिएगा, यह call काफी लंबी हो गई है। मैं आपको बाद में कॉल करूँगी। [CALL_END]"
                 self.state_machine.chat_history.append({"role": "assistant", "content": bot_text})
                 logger.info(f"[Exotel] Bot (Max Turns): {bot_text}")
@@ -998,14 +1013,30 @@ class ExotelVoiceConnectionManager:
                 messages = list(self.state_machine.chat_history)
                 messages.append({"role": "system", "content": instruction})
 
-                # 2. Get LLM Response from Groq (Plain text)
-                response = await groq_client.chat.completions.create(
-                    model=config.LLM_MODEL or "llama-3.3-70b-versatile",
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=150
-                )
-                bot_text = response.choices[0].message.content.strip()
+                # 2. Get LLM Response from Groq (with 1 retry on transient errors)
+                bot_text = None
+                for attempt in range(2):
+                    try:
+                        response = await groq_client.chat.completions.create(
+                            model=config.LLM_MODEL or "llama-3.3-70b-versatile",
+                            messages=messages,
+                            temperature=0.3,
+                            max_tokens=150
+                        )
+                        bot_text = response.choices[0].message.content.strip()
+                        break  # Success
+                    except Exception as llm_err:
+                        if attempt == 0:
+                            logger.warning(f"[Exotel] LLM attempt 1 failed: {llm_err}. Retrying in 1s...")
+                            await asyncio.sleep(1.0)
+                        else:
+                            raise  # Let outer except handle it
+
+                # Guard: Strip [CALL_END] if state machine hasn't moved to HANGUP
+                # Prevents the LLM from unilaterally ending calls
+                if "[CALL_END]" in bot_text and self.state_machine.state != CallState.HANGUP:
+                    logger.warning(f"[Exotel] LLM spontaneously added [CALL_END] in state {self.state_machine.state.value} — stripping it.")
+                    bot_text = re.sub(r'\[(?:CALL[\s_]*END|END[\s_]*CALL)\]', '', bot_text, flags=re.IGNORECASE).strip()
                 
                 self.state_machine.chat_history.append({
                     "role": "assistant",
