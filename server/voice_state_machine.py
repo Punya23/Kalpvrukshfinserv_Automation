@@ -306,6 +306,18 @@ OUTPUT RULES:
 
         self.chat_history.append({"role": "system", "content": persona})
 
+    def _lang_note(self) -> str:
+        """Return a brief language reminder for injection into every turn instruction."""
+        if self.language_preference == "english":
+            return "(Speak in natural English only — no Hindi.)"
+        return "(Speak in Hinglish — Hindi words in Devanagari, English terms in Latin.)"
+
+    def _max_recovery(self) -> int:
+        """Max recovery attempts before exit — matches the prompt's recovery system."""
+        if self.bot_type == "investment":
+            return 4   # Investment prompt S3.5 has 4 distinct recovery angles
+        return 3       # Insurance and Recruitment have 3 recovery stages
+
     def get_instruction_for_current_state(
         self,
         user_text: str,
@@ -315,18 +327,17 @@ OUTPUT RULES:
         """
         The core navigator. Called once per turn, before the main LLM call.
 
-        Responsibilities:
-        1. Drive state transitions based on classified_intent and schedule_info.
-        2. Return a brief situational instruction (injected as a system message)
-           telling the LLM what situation it is in and what its goal is this turn.
-        3. Enforce the hard turn limit.
+        Philosophy: These instructions are director's notes — they tell the LLM
+        what situation it's in and what the goal is, then let the prompt's stage
+        descriptions (S1, S2, S3, etc.) guide the actual words.
         """
         self.total_turns += 1
+        lang = self._lang_note()
 
         # Hard turn limit — cost control and troll protection
         if self.total_turns >= 15:
             self.state = CallState.HANGUP
-            return "The call has reached its limit. Wrap up warmly and append [CALL_END]."
+            return f"The call has gone on too long. Thank them genuinely for their time and say goodbye warmly. {lang} Append [CALL_END]."
             
         # ── VERIFY_NAME ──────────────────────────────────────────────
         if self.state == CallState.VERIFY_NAME:
@@ -343,52 +354,46 @@ OUTPUT RULES:
                 gender_form = "bol rahi hoon"
                 
             return (
-                "The user just responded to your initial 'Namaste'. "
-                f"Introduce yourself: 'Main Kalpvruksh Finserv se {bot_name} {gender_form}.' "
+                "The user just responded to your 'Namaste'. "
+                f"Introduce yourself warmly: 'Main Kalpvruksh Finserv se {bot_name} {gender_form}.' "
                 "Then ask their language preference naturally: 'क्या आप Hindi में बात करना prefer करेंगे या English में?' "
-                "If they corrected their name, acknowledge the correction warmly before introducing yourself. "
-                "Do NOT pitch anything yet. Just introduce + ask language."
+                "If they corrected their name, acknowledge it warmly first. "
+                "Keep it brief — just introduce + ask language. No pitch yet."
             )
 
         # ── LANGUAGE_CHECK ───────────────────────────────────────────
         if self.state == CallState.LANGUAGE_CHECK:
             self.state = CallState.CHECK_PERMISSION
             
-            # Language preference is set by the pipeline before this method is called
-            lang = self.language_preference
-            
-            if lang == "english":
+            if self.language_preference == "english":
                 lang_instruction = (
                     "LANGUAGE MODE: The customer chose ENGLISH. "
-                    "Speak in clean, natural English. No Hindi words at all. "
-                    "Keep it warm and conversational, not formal or corporate."
+                    "Speak in clean, natural English. No Hindi at all. Warm and conversational."
                 )
-            else:  # hinglish (default)
+            else:
                 lang_instruction = (
                     "LANGUAGE MODE: The customer chose HINDI. "
-                    "Speak in natural Hinglish — 70% Hindi (Devanagari script), 30% English terms. "
-                    "Hindi words in Devanagari: मैं, आप, अच्छा. English terms in Latin: SIP, insurance, mutual funds."
+                    "Speak in natural Hinglish — Hindi words in Devanagari, English terms in Latin."
                 )
             
-            # Generate the hook based on bot type — LLM creates natural language
+            # Reference the prompt's S1/OPENING stage — let the LLM create the hook
             if self.bot_type == "insurance":
                 hook_instruction = (
-                    "Now deliver your opening hook about healthcare protection. "
-                    "The intent is to make them think about whether their current health coverage "
-                    "is actually sufficient. Ask ONE engaging question. "
-                    "Do NOT use fear-based language. Keep it consultative."
+                    "Now follow your OPENING & DISCOVERY stage (Stage 1 in your prompt). "
+                    "Ask one engaging question about their healthcare protection. "
+                    "Be consultative, not salesy. Make them think."
                 )
             elif self.bot_type == "recruitment":
                 hook_instruction = (
-                    "Now deliver your opening hook about business partnership opportunities. "
-                    "The intent is to create curiosity about an additional income vertical. "
-                    "Ask ONE engaging question about their interest in growing their business."
+                    "Now follow your STAGE 1 — BUSINESS HOOK from your prompt. "
+                    "Create curiosity about the business partnership opportunity. "
+                    "Generate a fresh, natural opening — don't recite the prompt."
                 )
             else:  # investment
                 hook_instruction = (
-                    "Now deliver your opening hook about financial planning. "
-                    "The intent is to make them pause and think about whether their savings "
-                    "will be enough for rising future costs. Ask ONE engaging question."
+                    "Now follow your S1 — OPENING from your prompt. "
+                    "Make them pause and think about whether their savings are enough for the future. "
+                    "Generate a fresh question — never the same phrasing twice."
                 )
             
             return f"{lang_instruction}\n\n{hook_instruction}"
@@ -397,59 +402,168 @@ OUTPUT RULES:
         if self.state == CallState.CHECK_PERMISSION:
             if classified_intent == "YES":
                 self.state = CallState.QUALIFY
-                return (
-                    "The customer engaged positively with the opening hook. "
-                    "Start discovery with one relevant open question based on their answer. "
-                    "Do NOT pitch anything yet — just listen."
-                )
+                if self.bot_type == "insurance":
+                    return (
+                        f"They engaged with your opening hook. {lang} "
+                        "Follow your DISCOVERY stage — understand their current coverage situation. "
+                        "Ask one open question to learn if they have a policy, corporate cover, or nothing. "
+                        "Listen more than you talk."
+                    )
+                elif self.bot_type == "recruitment":
+                    return (
+                        f"They're curious. {lang} "
+                        "Move to your STAGE 2 — QUALIFICATION & PITCH. "
+                        "Match the pitch to their profession if you know it. "
+                        "Ask one question to understand their background."
+                    )
+                else:  # investment
+                    return (
+                        f"They engaged positively. {lang} "
+                        "Follow your S2 — DISCOVERY. Understand how they manage their finances. "
+                        "Do they handle it themselves? Have existing investments? "
+                        "Ask one open question. Don't pitch yet."
+                    )
             elif classified_intent == "NO":
                 self.state = CallState.HANGUP
-                return "The customer refused or indicated it is a wrong number. Apologize gracefully and naturally based on context, say goodbye warmly, and append [CALL_END]." 
-            else:  # MAYBE
                 return (
-                    "The customer seems hesitant or was unclear. "
-                    "Acknowledge their response warmly and make one more gentle attempt to get permission. "
-                    "Do not pitch — just ask for two minutes of their time."
+                    f"They clearly don't want to continue. {lang} "
+                    "Respect their decision gracefully. Thank them and say goodbye warmly. "
+                    "Output your [LEAD:...] tag with interest=dead, then append [CALL_END]."
                 )
+            else:  # MAYBE
+                if self.bot_type == "insurance":
+                    return (
+                        f"They seem hesitant — not a no, not a yes. {lang} "
+                        "Don't pitch. Just ask for one minute of their time. "
+                        "Mention that you have a quick question about their family's health protection."
+                    )
+                elif self.bot_type == "recruitment":
+                    return (
+                        f"They're unsure. {lang} "
+                        "Don't push. Just say you have a quick question about business opportunities in their area. "
+                        "Ask for just two minutes."
+                    )
+                else:
+                    return (
+                        f"They're hesitant but didn't refuse. {lang} "
+                        "Acknowledge warmly. Make one gentle attempt — mention it's just a quick question "
+                        "about making their savings work harder. Ask for two minutes."
+                    )
 
         # ── QUALIFY ──────────────────────────────────────────────────
         elif self.state == CallState.QUALIFY:
+            max_recovery = self._max_recovery()
+            
             if classified_intent == "YES":
                 self.recovery_count = 0
                 self.qualify_turns += 1
-                # Keep the conversation going for at least 2 qualify turns
-                # before offering the consultation — builds engagement and call length
-                if self.qualify_turns >= 2:
+                
+                # Require at least 3 qualify turns before offering the consultation
+                # This matches the prompt rule: "at least 3 organic conversational turns"
+                if self.qualify_turns >= 3:
                     self.state = CallState.SCHEDULE
+                    if self.bot_type == "insurance":
+                        return (
+                            f"The conversation has been good — they're engaged. {lang} "
+                            "Follow your MICRO-COMMITMENT stage (Stage 6). "
+                            "Offer the independent review framing first, then if they agree, "
+                            "suggest scheduling with संजीव सुराना. Low-pressure transition."
+                        )
+                    elif self.bot_type == "recruitment":
+                        return (
+                            f"They're genuinely interested after good conversation. {lang} "
+                            "Follow your STAGE 4 — APPOINTMENT PITCH. "
+                            "Transition naturally to suggesting a meeting with Mr Sanjeev Surana. "
+                            "Frame it as a partnership briefing, not a sales pitch."
+                        )
+                    else:  # investment
+                        return (
+                            f"Great discovery conversation. {lang} "
+                            "Follow your S5 — APPOINTMENT OFFER. "
+                            "Transition naturally to offering a free, short conversation with संजीव सुराना. "
+                            "Generate a warm bridge — never make it sound transactional."
+                        )
+                
+                # Still building — reference the appropriate prompt stage
+                if self.bot_type == "insurance":
                     return (
-                        "The customer is genuinely interested after good discovery. "
-                        "Now transition naturally: introduce the free consultation with संजीव सुराना "
-                        "and ask for a convenient day and time. Keep it warm and low-pressure."
+                        f"Conversation flowing well (turn {self.qualify_turns}/3). {lang} "
+                        "Follow your VALUE MOMENT or DISCOVERY stage. "
+                        "Build on what they just shared. Ask one follow-up to go deeper. "
+                        "If they mentioned a specific concern, explore it."
                     )
-                return (
-                    f"The customer is engaged (qualify turn {self.qualify_turns}/2). "
-                    "Ask ONE more discovery question to deepen the conversation. "
-                    "Build curiosity with a relatable insight before pitching the consultation."
-                )
+                elif self.bot_type == "recruitment":
+                    return (
+                        f"They're engaged (turn {self.qualify_turns}/3). {lang} "
+                        "Continue your STAGE 2 — QUALIFICATION. "
+                        "Build on their response. Share one relevant insight about the opportunity "
+                        "and ask one question to understand their interest level better."
+                    )
+                else:  # investment
+                    return (
+                        f"Discovery going well (turn {self.qualify_turns}/3). {lang} "
+                        "Follow your S2/S3 — DISCOVERY or CURIOSITY BUILDING. "
+                        "Build on what they shared. Surface a blind spot or share a relatable insight. "
+                        "Ask one follow-up that makes them think. Don't rush."
+                    )
+                    
             elif classified_intent == "NO":
                 self.recovery_count += 1
-                if self.recovery_count >= 3:
+                if self.recovery_count >= max_recovery:
                     self.state = CallState.HANGUP
                     return (
-                        "After three recovery attempts the customer is still not interested. "
-                        "Thank them sincerely and append [CALL_END]."
+                        f"You've tried {max_recovery} recovery angles and they're still not interested. {lang} "
+                        "Respect their decision. Thank them sincerely for their time. "
+                        "Output your [LEAD:...] tag with the right status, then append [CALL_END]."
                     )
+                
+                # Reference the prompt's recovery system with specific angle guidance
+                if self.bot_type == "insurance":
+                    recovery_angles = [
+                        "Follow your R1 recovery — mention that most people haven't reviewed their policy in years.",
+                        "Follow your R2 recovery — connect to changing family responsibilities.",
+                        "Follow your R3 recovery — frame it as an independent review with no obligations. Offer WhatsApp follow-up.",
+                    ]
+                elif self.bot_type == "recruitment":
+                    recovery_angles = [
+                        "Follow your STAGE 3 Attempt 1 — normalize their hesitation, mention recurring income model.",
+                        "Follow your STAGE 3 Attempt 2 — clarify this isn't MLM or a job. It's a franchise model.",
+                        "Follow your STAGE 3 Attempt 3 — last try. If still no, exit warmly.",
+                    ]
+                else:  # investment — 4 recovery angles
+                    recovery_angles = [
+                        "Follow your S3.5 Attempt 1 — normalize hesitation. Busy professionals often delay reviews.",
+                        "Follow your S3.5 Attempt 2 — connect to a concrete milestone: children's education, home, retirement.",
+                        "Follow your S3.5 Attempt 3 — social proof. Others in Pune found one conversation useful.",
+                        "Follow your S3.5 Attempt 4 — zero-pressure framing. Free, short, no product push.",
+                    ]
+                
+                angle_idx = min(self.recovery_count - 1, len(recovery_angles) - 1)
                 return (
-                    f"Soft refusal — recovery attempt {self.recovery_count}/3. "
-                    "Do NOT end the call. Use a completely fresh angle: a surprising insight, "
-                    "a relatable story, or a new question. Never repeat what you already said."
+                    f"Soft refusal — recovery attempt {self.recovery_count}/{max_recovery}. {lang} "
+                    f"{recovery_angles[angle_idx]} "
+                    "Generate completely fresh language. Never repeat what you already said."
                 )
+                
             else:  # MAYBE
-                return (
-                    "The customer is uncertain. Validate their hesitation empathetically, "
-                    "share one brief relatable insight, and ask one gentle follow-up question. "
-                    "Keep them talking — engagement is the goal."
-                )
+                if self.bot_type == "insurance":
+                    return (
+                        f"They're on the fence — not refusing, not agreeing. {lang} "
+                        "Gently acknowledge their hesitation. Share one brief, relatable point "
+                        "about how quickly medical costs are rising. Ask one soft follow-up."
+                    )
+                elif self.bot_type == "recruitment":
+                    return (
+                        f"They're thinking about it. {lang} "
+                        "Don't push. Acknowledge naturally and share one small insight "
+                        "about what professionals in similar roles are doing. Ask one gentle question."
+                    )
+                else:
+                    return (
+                        f"They're uncertain but still on the call. {lang} "
+                        "Validate their hesitation empathetically. Share one brief relatable insight "
+                        "based on what they've shared so far. Ask one gentle follow-up to keep them talking."
+                    )
 
         # ── SCHEDULE ─────────────────────────────────────────────────
         elif self.state == CallState.SCHEDULE:
@@ -464,37 +578,38 @@ OUTPUT RULES:
             if self.scheduled_day and self.scheduled_time:
                 self.state = CallState.CONFIRM
                 return (
-                    f"Both day ({self.scheduled_day}) and time ({self.scheduled_time}) are confirmed. "
+                    f"Both day ({self.scheduled_day}) and time ({self.scheduled_time}) confirmed. {lang} "
                     f"Output: [APPOINTMENT: day={self.scheduled_day}, time={self.scheduled_time}, "
                     f"name={self.customer_name or 'unknown'}] "
-                    "Then confirm the slot warmly and append [CALL_END]."
+                    "Then confirm warmly and append [CALL_END]."
                 )
             elif self.scheduled_day and not self.scheduled_time:
                 return (
-                    f"Day is set ({self.scheduled_day}) but time is missing. "
-                    "Ask specifically: kis samay convenient rahega?"
+                    f"Day is set ({self.scheduled_day}) but no time yet. {lang} "
+                    "Ask naturally what time works best for them — morning or afternoon/evening."
                 )
             elif self.scheduled_time and not self.scheduled_day:
                 return (
-                    f"Time is set ({self.scheduled_time}) but day is missing. "
-                    "Ask: aaj ya kal — kab better rahega?"
+                    f"Time is set ({self.scheduled_time}) but no day yet. {lang} "
+                    "Ask naturally which day works — today, tomorrow, or another day."
                 )
             else:
                 return (
-                    "Neither day nor time collected yet. "
-                    "Ask clearly and simply: aap kab free honge — aur kis samay?"
+                    f"They agreed to the meeting but haven't given day or time. {lang} "
+                    "Ask warmly: which day and time would be convenient for them?"
                 )
 
         # ── CONFIRM ──────────────────────────────────────────────────
         elif self.state == CallState.CONFIRM:
             self.state = CallState.HANGUP
             return (
-                f"Appointment confirmed: {self.scheduled_day} at {self.scheduled_time}. "
+                f"Appointment confirmed: {self.scheduled_day} at {self.scheduled_time}. {lang} "
                 f"Output: [APPOINTMENT: day={self.scheduled_day}, time={self.scheduled_time}, "
                 f"name={self.customer_name or 'unknown'}] "
-                "Then say a warm, genuine goodbye and append [CALL_END]."
+                "Confirm the details warmly, mention that संजीव सुराना will connect with them, "
+                "output your [LEAD:...] tag, and append [CALL_END]."
             )
 
         # ── HANGUP ───────────────────────────────────────────────────
         else:
-            return "Wrap up warmly and append [CALL_END]."
+            return f"The call is ending. Say a warm, genuine goodbye. {lang} Output your [LEAD:...] tag and append [CALL_END]."
