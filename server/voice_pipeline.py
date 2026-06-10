@@ -14,6 +14,29 @@ from server.voice_state_machine import CallState, VoiceStateMachine, classify_bo
 
 logger = logging.getLogger(__name__)
 
+import csv
+
+def _append_to_qa_csv(call_log: dict):
+    """Helper function to log every call to the master QA CSV."""
+    qa_file = Path("data/qa_call_logs_master.csv")
+    qa_file.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = qa_file.exists()
+    
+    headers = [
+        "timestamp", "phone", "customer_name", "customer_category", "bot_type",
+        "outcome", "scheduled_day", "scheduled_time", "lead_score", "lead_category",
+        "llm_interest", "llm_objection", "llm_summary", "full_transcript"
+    ]
+    
+    try:
+        with open(qa_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(call_log)
+    except Exception as e:
+        logger.error(f"Failed to append to QA CSV: {e}")
+
 # Initialize AWS Polly Client
 polly_client = boto3.client(
     "polly",
@@ -278,6 +301,7 @@ class VoiceConnectionManager:
             
             speak_text = re.sub(r'\[(?:CALL[\s_]*END|END[\s_]*CALL)\]', '', bot_text, flags=re.IGNORECASE).strip()
             speak_text = speak_text.replace("[HANG_UP]", "").strip()
+            speak_text = speak_text.replace("[RECOVERY]", "").strip()
             speak_text = re.sub(r'\[APPOINTMENT:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
             speak_text = re.sub(r'\[LEAD:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
 
@@ -383,7 +407,7 @@ class VoiceConnectionManager:
 
             # Build LeadData with LLM results
             category_map = {"HOT": LeadCategory.HOT, "WARM": LeadCategory.WARM, "COLD": LeadCategory.COLD, "DNC": LeadCategory.DNC}
-            bot_type_map = {"investment": BotType.INVESTMENT, "insurance": BotType.INSURANCE}
+            bot_type_map = {"investment": BotType.INVESTMENT, "insurance": BotType.INSURANCE, "recruitment": BotType.RECRUITMENT}
             lead = LeadData(
                 name=getattr(self, 'customer_name', ''),
                 phone=getattr(self, 'caller_phone', ''),
@@ -418,6 +442,8 @@ class VoiceConnectionManager:
                 log_path = call_log_dir / log_filename
                 log_path.write_text(json.dumps(call_log, indent=2, ensure_ascii=False), encoding="utf-8")
                 logger.info(f"[Twilio] Call transcript saved: {log_path}")
+                _append_to_qa_csv(call_log)
+                logger.info(f"[Twilio] Appended to QA CSV log")
             except Exception as e:
                 logger.error(f"[Twilio] Failed to save transcript to disk: {e}")
 
@@ -1048,6 +1074,7 @@ class ExotelVoiceConnectionManager:
             
             speak_text = re.sub(r'\[(?:CALL[\s_]*END|END[\s_]*CALL)\]', '', bot_text, flags=re.IGNORECASE).strip()
             speak_text = speak_text.replace("[HANG_UP]", "").strip()
+            speak_text = speak_text.replace("[RECOVERY]", "").strip()
             speak_text = re.sub(r'\[APPOINTMENT:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
             speak_text = re.sub(r'\[LEAD:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
 
@@ -1128,7 +1155,7 @@ class ExotelVoiceConnectionManager:
 
             # Build LeadData with LLM results
             category_map = {"HOT": LeadCategory.HOT, "WARM": LeadCategory.WARM, "COLD": LeadCategory.COLD, "DNC": LeadCategory.DNC}
-            bot_type_map = {"investment": BotType.INVESTMENT, "insurance": BotType.INSURANCE}
+            bot_type_map = {"investment": BotType.INVESTMENT, "insurance": BotType.INSURANCE, "recruitment": BotType.RECRUITMENT}
             lead = LeadData(
                 name=self.customer_name,
                 phone=getattr(self, 'caller_phone', ''),
@@ -1163,6 +1190,8 @@ class ExotelVoiceConnectionManager:
                 log_path = call_log_dir / log_filename
                 log_path.write_text(json.dumps(call_log, indent=2, ensure_ascii=False), encoding="utf-8")
                 logger.info(f"[Exotel] Call transcript saved: {log_path}")
+                _append_to_qa_csv(call_log)
+                logger.info(f"[Exotel] Appended to QA CSV log")
             except Exception as e:
                 logger.error(f"[Exotel] Failed to save transcript to disk: {e}")
 

@@ -4,11 +4,13 @@ Automated cron-based scheduler that checks for upcoming renewals
 and triggers outbound reminder calls/messages.
 """
 
-import asyncio
+import json
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from server.sheets_manager import sheets_manager, whatsapp_notifier
+from server.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,31 @@ class RenewalScheduler:
 
     REMINDER_MILESTONES = [60, 30, 15, 7, 1]
 
+    def __init__(self):
+        self.tracker_file = config.DATA_DIR / "reminder_tracker.json"
+        self.tracker_file.parent.mkdir(parents=True, exist_ok=True)
+        self._tracker_data = self._load_tracker()
+
+    def _load_tracker(self) -> dict:
+        if self.tracker_file.exists():
+            try:
+                return json.loads(self.tracker_file.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+        return {}
+
+    def _save_tracker(self):
+        self.tracker_file.write_text(json.dumps(self._tracker_data, indent=2), encoding="utf-8")
+
+    def _already_sent(self, phone: str, milestone: int) -> bool:
+        key = f"{phone}_{milestone}"
+        return key in self._tracker_data
+
+    def _mark_sent(self, phone: str, milestone: int):
+        key = f"{phone}_{milestone}"
+        self._tracker_data[key] = datetime.now().isoformat()
+        self._save_tracker()
+
     async def check_and_send_reminders(self):
         """Main scheduler function — checks renewals and sends appropriate reminders."""
         logger.info("🔄 Running renewal check...")
@@ -44,6 +71,10 @@ class RenewalScheduler:
 
         reminders_sent = 0
         for renewal in renewals:
+            phone = renewal.get("Phone", "")
+            if not phone:
+                continue
+                
             days_left = renewal.get("Days Until Expiry")
             if days_left is None:
                 # Calculate from expiry date
@@ -53,17 +84,24 @@ class RenewalScheduler:
                 except (ValueError, KeyError):
                     continue
 
-            # Check if this renewal matches any milestone
+            # Check if this renewal matches any milestone using range-based check
             for milestone in self.REMINDER_MILESTONES:
-                if days_left == milestone:
-                    await self._send_reminder(renewal, days_left)
-                    reminders_sent += 1
-                    break
+                if days_left <= milestone:
+                    if not self._already_sent(phone, milestone):
+                        await self._send_reminder(renewal, days_left)
+                        self._mark_sent(phone, milestone)
+                        reminders_sent += 1
+                    break  # Only evaluate the highest applicable milestone
 
             # Also handle overdue (grace period)
             if -30 <= days_left < 0:
-                await self._send_overdue_alert(renewal, abs(days_left))
-                reminders_sent += 1
+                # Use milestone "overdue" to track if sent today or track uniquely
+                # Let's track overdue messages too
+                overdue_milestone = f"overdue_{abs(days_left)}"
+                if not self._already_sent(phone, overdue_milestone):
+                    await self._send_overdue_alert(renewal, abs(days_left))
+                    self._mark_sent(phone, overdue_milestone)
+                    reminders_sent += 1
 
         logger.info(f"✅ Renewal check complete. {reminders_sent} reminders sent.")
 
@@ -99,7 +137,7 @@ class RenewalScheduler:
             f"• Continuity benefit chala jayega\n"
             f"• No Claim Bonus reset ho jayega\n"
             f"• Naye waiting periods lagenge\n\n"
-            f"Abhi call karein: {renewal.get('Phone', '')}\n"
+            f"Abhi call karein: {config.MANAGER_PHONE or config.MANAGER_WHATSAPP_NUMBER}\n"
             f"— Kalpvruksh Finserv 🌳"
         )
         await whatsapp_notifier._send_whatsapp(phone, overdue_message)

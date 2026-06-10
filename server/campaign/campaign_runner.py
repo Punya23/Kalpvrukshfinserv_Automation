@@ -8,12 +8,14 @@ import csv
 import json
 import asyncio
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from enum import Enum
 
 import requests
+from twilio.rest import Client as TwilioClient
 
 from server.config import config
 from server.campaign.trai_compliance import (
@@ -62,6 +64,7 @@ class CampaignRunner:
         self.results: list[dict] = []
         self.current_index: int = 0
         self.bot_type: str = "investment"
+        self.telephony_provider: str = "twilio"  # "twilio" or "exotel"
         self.gap_seconds: int = 90  # Gap between calls
         self.max_calls: int = 50
         self.enforce_optimal_windows: bool = True
@@ -135,16 +138,18 @@ class CampaignRunner:
     async def start(
         self,
         bot_type: str = "investment",
-        csv_path: str = "data/leads/hni_leads_pune.csv",
+        csv_path: str = "data/leads/unified_compliant_leads.csv",
         gap_seconds: int = 90,
         max_calls: int = 50,
         enforce_optimal_windows: bool = True,
+        telephony_provider: str = "twilio",
     ) -> dict:
         """Start the campaign. Runs as a background asyncio task."""
         if self.status == CampaignStatus.RUNNING:
             return {"error": "Campaign already running", "status": self.get_status()}
 
         self.bot_type = bot_type
+        self.telephony_provider = telephony_provider
         self.gap_seconds = gap_seconds
         self.max_calls = max_calls
         self.enforce_optimal_windows = enforce_optimal_windows
@@ -239,7 +244,7 @@ class CampaignRunner:
             self.status = CampaignStatus.ERROR
 
     async def _make_single_call(self, lead: dict) -> dict:
-        """Trigger a single Exotel call and wait for it to complete."""
+        """Trigger a single call via configured telephony provider and wait for completion."""
         phone = lead.get("phone", "").strip()
         name = lead.get("name", "").strip()
         category = lead.get("category", "").strip()
@@ -253,50 +258,28 @@ class CampaignRunner:
         # Track which call logs exist BEFORE the call
         call_logs_before = set(Path("data/call_logs").glob("*.json"))
 
-        # Trigger call via Exotel REST API
         call_result = {
             "phone": phone,
             "name": name,
             "category": category,
             "bot_type": self.bot_type,
+            "telephony": self.telephony_provider,
             "timestamp": datetime.now().isoformat(),
             "outcome": "unknown",
-            "exotel_status": "unknown",
+            "call_status": "unknown",
         }
 
         try:
-            url = (
-                f"https://{config.EXOTEL_API_KEY}:{config.EXOTEL_API_TOKEN}"
-                f"@{config.EXOTEL_SUBDOMAIN}/v1/Accounts/{config.EXOTEL_ACCOUNT_SID}"
-                f"/Calls/connect.json"
-            )
-
-            form_data = {
-                "From": phone,
-                "CallerId": config.EXOTEL_CALLER_ID,
-                "Url": f"http://my.exotel.com/{config.EXOTEL_ACCOUNT_SID}/exoml/start_voice/{config.EXOTEL_APP_ID}",
-                "CallType": "trans",
-                "CustomField": json.dumps({
-                    "bot_type": self.bot_type,
-                    "customer_name": name,
-                    "category": category,
-                }),
-            }
-
-            response = requests.post(url, data=form_data, timeout=30)
-
-            if response.status_code == 200:
-                call_result["exotel_status"] = "initiated"
-                logger.info(f"[Campaign] Call initiated to {name} ({phone})")
+            if self.telephony_provider == "twilio":
+                call_result = await self._initiate_twilio_call(phone, name, category, call_result)
             else:
-                call_result["exotel_status"] = "failed"
-                call_result["outcome"] = "api_error"
-                call_result["error"] = response.text[:200]
-                logger.error(f"[Campaign] Exotel API error: {response.status_code}")
+                call_result = await self._initiate_exotel_call(phone, name, category, call_result)
+
+            if call_result.get("outcome") == "api_error":
                 return call_result
 
         except Exception as e:
-            call_result["exotel_status"] = "failed"
+            call_result["call_status"] = "failed"
             call_result["outcome"] = "api_error"
             call_result["error"] = str(e)
             logger.error(f"[Campaign] Call failed: {e}")
@@ -307,6 +290,68 @@ class CampaignRunner:
         call_result["outcome"] = await self._wait_for_call_completion(
             call_logs_before, timeout_seconds=300
         )
+
+        return call_result
+
+    async def _initiate_twilio_call(self, phone: str, name: str, category: str, call_result: dict) -> dict:
+        """Trigger a call via Twilio REST API."""
+        if not config.TWILIO_ACCOUNT_SID or not config.TWILIO_AUTH_TOKEN:
+            call_result["call_status"] = "failed"
+            call_result["outcome"] = "api_error"
+            call_result["error"] = "Twilio credentials missing"
+            return call_result
+
+        client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
+        host = os.getenv("TUNNEL_HOST", "localhost:8000")
+        webhook_url = f"https://{host}/twilio/incoming-call" if "localhost" not in host else f"http://{host}/twilio/incoming-call"
+
+        try:
+            call = client.calls.create(
+                url=webhook_url,
+                to=phone,
+                from_=getattr(config, "TWILIO_PHONE_NUMBER", ""),
+            )
+            call_result["call_status"] = "initiated"
+            call_result["call_sid"] = call.sid
+            logger.info(f"[Campaign/Twilio] Call initiated to {name} ({phone}) — SID: {call.sid}")
+        except Exception as e:
+            call_result["call_status"] = "failed"
+            call_result["outcome"] = "api_error"
+            call_result["error"] = str(e)
+            logger.error(f"[Campaign/Twilio] Call failed: {e}")
+
+        return call_result
+
+    async def _initiate_exotel_call(self, phone: str, name: str, category: str, call_result: dict) -> dict:
+        """Trigger a call via Exotel REST API."""
+        url = (
+            f"https://{config.EXOTEL_API_KEY}:{config.EXOTEL_API_TOKEN}"
+            f"@{config.EXOTEL_SUBDOMAIN}/v1/Accounts/{config.EXOTEL_ACCOUNT_SID}"
+            f"/Calls/connect.json"
+        )
+
+        form_data = {
+            "From": phone,
+            "CallerId": config.EXOTEL_CALLER_ID,
+            "Url": f"http://my.exotel.com/{config.EXOTEL_ACCOUNT_SID}/exoml/start_voice/{config.EXOTEL_APP_ID}",
+            "CallType": "trans",
+            "CustomField": json.dumps({
+                "bot_type": self.bot_type,
+                "customer_name": name,
+                "category": category,
+            }),
+        }
+
+        response = requests.post(url, data=form_data, timeout=30)
+
+        if response.status_code == 200:
+            call_result["call_status"] = "initiated"
+            logger.info(f"[Campaign/Exotel] Call initiated to {name} ({phone})")
+        else:
+            call_result["call_status"] = "failed"
+            call_result["outcome"] = "api_error"
+            call_result["error"] = response.text[:200]
+            logger.error(f"[Campaign/Exotel] API error: {response.status_code}")
 
         return call_result
 

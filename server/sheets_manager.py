@@ -185,61 +185,31 @@ class SheetsManager:
         """Fetch policies due for renewal in the next N days."""
         spreadsheet = self._get_spreadsheet()
         if spreadsheet is None:
-            # Return sample data for testing
-            return self._get_sample_renewals()
+            logger.warning("Google Sheets unavailable — no renewals fetched. Skipping.")
+            return []
 
         try:
             worksheet = spreadsheet.worksheet(config.RENEWALS_SHEET_NAME)
             records = worksheet.get_all_records()
-            # Filter by date logic would go here
-            return records
+            
+            today = datetime.now().date()
+            filtered = []
+            for r in records:
+                try:
+                    expiry_str = r.get("Expiry Date", "").strip()
+                    if not expiry_str:
+                        continue
+                    expiry = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+                    days_left = (expiry - today).days
+                    if -30 <= days_left <= days_ahead:
+                        r["Days Until Expiry"] = days_left
+                        filtered.append(r)
+                except (ValueError, TypeError):
+                    continue
+            return filtered
         except Exception as e:
             logger.error(f"Failed to read renewals: {e}")
-            return self._get_sample_renewals()
-
-    def _get_sample_renewals(self) -> list[dict]:
-        """Return sample renewal data for testing without Google Sheets."""
-        return [
-            {
-                "Customer ID": "KF-001",
-                "Name": "Rajesh Sharma",
-                "Phone": "919876543001",
-                "Policy Number": "SH-HI-2024-001",
-                "Insurer": "Star Health",
-                "Plan": "Family Health Optima",
-                "Sum Insured": 1000000,
-                "Premium": 22000,
-                "Expiry Date": "2026-07-01",
-                "Days Until Expiry": 29,
-                "Status": "Active",
-            },
-            {
-                "Customer ID": "KF-002",
-                "Name": "Priya Deshmukh",
-                "Phone": "919876543002",
-                "Policy Number": "SH-HI-2024-002",
-                "Insurer": "Star Health",
-                "Plan": "Senior Citizens Red Carpet",
-                "Sum Insured": 500000,
-                "Premium": 35000,
-                "Expiry Date": "2026-06-15",
-                "Days Until Expiry": 13,
-                "Status": "Active",
-            },
-            {
-                "Customer ID": "KF-003",
-                "Name": "Amit Kulkarni",
-                "Phone": "919876543003",
-                "Policy Number": "SH-HI-2024-003",
-                "Insurer": "Star Health",
-                "Plan": "Star Comprehensive",
-                "Sum Insured": 2500000,
-                "Premium": 48000,
-                "Expiry Date": "2026-06-08",
-                "Days Until Expiry": 6,
-                "Status": "Active",
-            },
-        ]
+            return []
 
 
 class WhatsAppNotifier:

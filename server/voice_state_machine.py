@@ -221,6 +221,8 @@ class VoiceStateMachine:
         self.scheduled_time    = None
         self.qualify_turns     = 0   # Turns spent in QUALIFY — gates appointment offer
         self.total_turns       = 0   # Hard limit guard
+        self.recovery_count    = 0   # Track hard refusals/hesitations
+        self.has_pivoted       = False # Ensure pivot only happens once
         self.chat_history      = []  # Trimmed to last 10 msgs for LLM context
         self.full_transcript   = []  # NEVER trimmed — used for scoring + disk logging
         self._initialize_persona()
@@ -268,10 +270,10 @@ class VoiceStateMachine:
         persona = f"""{identity_block}
 
 TTS SCRIPT RULES (Critical for Polly pronunciation):
-- Hindi/Hinglish words → Devanagari: मैं, आप, अच्छा, कल, ठीक है, बिल्कुल
+- Every Hindi word must be written in Devanagari. There are no exceptions. If you are unsure whether a word is Hindi, write it in Devanagari.
 - Financial/English terms → Latin: SIP, mutual funds, savings, insurance, consultation, Kalpvruksh Finserv
 - Founder name in Devanagari: संजीव सुराना — never "Sandeep Khurana" or any other name
-- NEVER transliterate Hindi into Latin script (never write "main", "aap", "achha")
+- NEVER transliterate Hindi into Latin script (never write "main", "aap", "achha", "samajh", "sakti")
 
 OUTPUT RULES:
 - HARD LIMIT: 15-20 words per turn. ONE sentence. ONE question. Then STOP.
@@ -317,6 +319,13 @@ OUTPUT RULES:
         if "[CALL_END]" in bot_text:
             self.state = CallState.HANGUP
 
+        # Track recoveries
+        if "[RECOVERY]" in bot_text:
+            self.recovery_count += 1
+            bot_text = bot_text.replace("[RECOVERY]", "").strip()
+
+        return bot_text
+
     # ── Core Navigator ──────────────────────────────────────────────
 
     def get_instruction_for_current_state(self, user_text: str) -> str:
@@ -333,6 +342,15 @@ OUTPUT RULES:
         if self.total_turns >= 15:
             self.state = CallState.HANGUP
             return f"The call has gone on too long. Thank them genuinely for their time and say goodbye warmly. {lang} Append [CALL_END]."
+
+        # Deterministic Pivot Injection
+        if self.recovery_count >= 2 and not self.has_pivoted and self.bot_type in ("insurance", "investment"):
+            self.has_pivoted = True
+            return (
+                f"The customer has refused multiple times. {lang} "
+                "Do NOT exit yet. Pivot entirely — surface the advisory income opportunity angle. "
+                "One sentence, one question. If no engagement after that, exit warmly with [CALL_END]."
+            )
 
         # ── OPENING ─────────────────────────────────────────────────
         # User just responded to "Namaste Sanjeev ji?" — introduce yourself AND deliver hook in ONE turn
@@ -367,7 +385,7 @@ OUTPUT RULES:
 
             return (
                 f"The user just responded to your 'Namaste'. {lang} "
-                f"Introduce yourself briefly: 'Main Kalpvruksh Finserv se {bot_name} {gender_form}.' "
+                f"Introduce yourself briefly: 'Main Kalpvruksh Finserv se {bot_name} {gender_form} — Pune की एक leading financial advisory firm.' "
                 f"If they corrected their name, acknowledge it warmly first. "
                 f"{hook}"
             )
@@ -423,17 +441,16 @@ OUTPUT RULES:
                         f"The conversation has been going well. {lang} "
                         "Do NOT use their name.\n\n"
                         "Read the user's last message:\n"
-                        "• If they're still engaged → follow your MICRO-COMMITMENT stage. "
-                        "Offer a free, independent review with संजीव सुराना. If they agree, ask which day works.\n"
-                        "• If they pushed back or said no → follow your recovery system. Try one fresh angle.\n"
-                        "• If they clearly refused → append [CALL_END]."
+                        "- If they're still engaged → follow your MICRO-COMMITMENT stage. "
+                        "Offer a free, independent review with हमारे Founder संजीव सुराना (15+ years experience). If they agree, ask which day works.\n"
+                        "- If they pushed back or clearly refused → Do NOT exit yet. Pivot entirely — surface the advisory income opportunity angle. One sentence, one question. If no engagement after that, exit warmly with [CALL_END]."
                     )
                 elif self.bot_type == "recruitment":
                     return (
                         f"Good conversation so far. {lang} "
                         "Do NOT use their name.\n\n"
-                        "• If engaged → follow STAGE 4 — APPOINTMENT PITCH. "
-                        "Suggest a meeting with Mr Sanjeev Surana. Ask which day works.\n"
+                        "- If engaged → follow STAGE 4 — APPOINTMENT PITCH. "
+                        "Suggest a meeting with हमारे Founder संजीव सुराना. Ask which day works.\n"
                         "• If hesitant → try one more angle from your recovery system.\n"
                         "• If refused → append [CALL_END]."
                     )
@@ -442,11 +459,10 @@ OUTPUT RULES:
                         f"Great conversation so far. {lang} "
                         "Do NOT use their name.\n\n"
                         "Read the user's last message:\n"
-                        "• If they're engaged → follow your S5 — APPOINTMENT OFFER. "
-                        "Transition naturally to offering a free, short chat with संजीव सुराना. "
+                        "- If they're engaged → follow your S5 — APPOINTMENT OFFER. "
+                        "Transition naturally to offering a free, short chat with हमारे Founder संजीव सुराना (15+ years experience). "
                         "If they agree, ask which day works.\n"
-                        "• If they pushed back → follow your S3.5 RECOVERY with a fresh angle.\n"
-                        "• If clearly refused → append [CALL_END]."
+                        "- If they pushed back or clearly refused → Do NOT exit yet. Pivot entirely — surface the advisory income opportunity angle. One sentence, one question. If no engagement after that, exit warmly with [CALL_END]."
                     )
 
             # Still in discovery/curiosity building phase
@@ -484,7 +500,7 @@ OUTPUT RULES:
         # ── SCHEDULE ─────────────────────────────────────────────────
         elif self.state == CallState.SCHEDULE:
             return (
-                f"You're scheduling a meeting with संजीव सुराना. {lang} "
+                f"You're scheduling a meeting with हमारे Founder संजीव सुराना. {lang} "
                 "Do NOT use their name.\n\n"
                 "Read the user's last message:\n"
                 "• If they gave a day and time → output: [APPOINTMENT: day=<YYYY-MM-DD>, time=<HH:MM>, "
@@ -506,7 +522,7 @@ OUTPUT RULES:
                 f"Appointment confirmed: {self.scheduled_day} at {self.scheduled_time}. {lang} "
                 f"Output: [APPOINTMENT: day={self.scheduled_day}, time={self.scheduled_time}, "
                 f"name={self.customer_name or 'unknown'}] "
-                "Confirm the details warmly, mention that संजीव सुराना will connect with them, "
+                "Confirm the details warmly, mention that हमारे Founder संजीव सुराना will connect with them, "
                 "and append [CALL_END]."
             )
 

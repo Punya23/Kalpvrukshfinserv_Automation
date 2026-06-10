@@ -29,6 +29,7 @@ class BotType(str, Enum):
     INSURANCE = "insurance"
     INVESTMENT = "investment"
     REMINDER = "reminder"
+    RECRUITMENT = "recruitment"
 
 
 @dataclass

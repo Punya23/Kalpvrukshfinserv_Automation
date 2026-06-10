@@ -76,8 +76,20 @@ async def lifespan(app: FastAPI):
         id="daily_renewal_check",
         replace_existing=True,
     )
+
+    # Start the nightly lead scraper (runs daily at 8:00 PM IST)
+    scheduler.add_job(
+        run_nightly_scrape,
+        "cron",
+        hour=20,
+        minute=0,
+        id="nightly_lead_scrape",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info("📅 Renewal scheduler started (daily at 09:00 AM)")
+    logger.info("🔍 Lead scraper scheduled (daily at 08:00 PM)")
     logger.info(f"🤖 LLM Provider: {config.LLM_PROVIDER} ({config.LLM_MODEL})")
     logger.info(f"🌐 Server: http://{config.SERVER_HOST}:{config.SERVER_PORT}")
     logger.info("=" * 60)
@@ -87,6 +99,52 @@ async def lifespan(app: FastAPI):
     # Shutdown
     scheduler.shutdown()
     logger.info("🌳 Kalpvruksh Finserv AI Automation — Stopped.")
+
+
+async def run_nightly_scrape():
+    """
+    Nightly lead scraper — runs at 8 PM IST.
+    Uses the lead_pipeline collectors to scrape fresh leads,
+    deduplicates against existing data, and saves to unified CSV.
+    """
+    import asyncio
+    from server.lead_pipeline.core.csv_manager import UnifiedCSVManager
+    from server.lead_pipeline.core.compliance import ComplianceGate
+
+    logger.info("🔍 Nightly lead scrape starting...")
+
+    queries = [
+        ("doctors in pune", "doctor"),
+        ("architects in pune", "architect"),
+        ("CA chartered accountant in pune", "CA"),
+        ("interior designers in pune", "interior_designer"),
+        ("dentists in pune", "dentist"),
+    ]
+
+    csv_manager = UnifiedCSVManager()
+    compliance = ComplianceGate()
+    total_new = 0
+
+    for query, category in queries:
+        try:
+            # Use the DDG/Nominatim collector (no browser needed, works on Railway)
+            from server.lead_pipeline.collectors.collector_nominatim import NominatimCollector
+            collector = NominatimCollector()
+            leads = collector.fetch_real_leads(query, limit=15)
+
+            compliant = [l for l in leads if compliance.is_lead_callable(l)]
+            if compliant:
+                csv_manager.save_leads(compliant)
+                total_new += len(compliant)
+                logger.info(f"🔍 [{category}] Scraped {len(compliant)} compliant leads")
+            else:
+                logger.info(f"🔍 [{category}] No new compliant leads")
+
+        except Exception as e:
+            logger.error(f"🔍 [{category}] Scrape failed: {e}")
+            continue
+
+    logger.info(f"✅ Nightly scrape complete. {total_new} new leads added.")
 
 
 # -------------------------------------------------------
@@ -488,6 +546,13 @@ async def trigger_renewal_check():
     return {"status": "Renewal check completed"}
 
 
+@app.post("/api/trigger-scrape")
+async def trigger_scrape():
+    """Manually trigger the lead scraper (for testing)."""
+    await run_nightly_scrape()
+    return {"status": "Scrape completed"}
+
+
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
     """Clear conversation history for a session."""
@@ -531,10 +596,11 @@ async def health_check():
 class StartCampaignRequest(BaseModel):
     """Request model for starting a calling campaign."""
     bot_type: str = "investment"  # "investment", "insurance", or "recruitment"
-    csv_path: str = "data/leads/hni_leads_pune.csv"
+    csv_path: str = "data/leads/unified_compliant_leads.csv"
     gap_seconds: int = 90  # Seconds between calls
     max_calls: int = 50
     enforce_optimal_windows: bool = True  # Only call during 10-12 AM, 3-5 PM
+    telephony_provider: str = "twilio"  # "twilio" or "exotel"
 
 
 @app.post("/api/start-campaign")
@@ -559,6 +625,7 @@ async def start_campaign(request: StartCampaignRequest):
         gap_seconds=request.gap_seconds,
         max_calls=request.max_calls,
         enforce_optimal_windows=request.enforce_optimal_windows,
+        telephony_provider=request.telephony_provider,
     )
     status_code = 200 if "error" not in result else 400
     return JSONResponse(result, status_code=status_code)
