@@ -60,7 +60,10 @@ async def run_call(bot_type, user_turns, customer_name="Amit", label=""):
         sm.chat_history.append({"role": "assistant", "content": speak or bot_text})
         sm.full_transcript.append({"role": "assistant", "content": bot_text})
 
-        flag = " ⚠️PIVOT" if PIVOT_MARKERS.search(speak) else ""
+        # Pivot detection only makes sense for non-recruitment bots — if we're
+        # ALREADY testing the recruitment bot, income/commission talk is correct
+        # content, not a leaked pivot.
+        flag = " ⚠️PIVOT" if bot_type != "recruitment" and PIVOT_MARKERS.search(speak) else ""
         if flag:
             pivot_hits.append((i, speak))
         wc = len(speak.split())
@@ -69,7 +72,10 @@ async def run_call(bot_type, user_turns, customer_name="Amit", label=""):
         if sm.state == CallState.HANGUP or "[CALL_END]" in bot_text:
             print("   (call ended)")
             break
-    verdict = "❌ PIVOTED to recruitment" if pivot_hits else "✅ stayed on-product"
+    if bot_type == "recruitment":
+        verdict = "✅ recruitment bot (pivot check N/A)"
+    else:
+        verdict = "❌ PIVOTED to recruitment" if pivot_hits else "✅ stayed on-product"
     print(f"\n   → {verdict}")
     return pivot_hits, transcript
 
@@ -95,6 +101,11 @@ INS_REFUSAL = [
     "पहले से policy है", "नहीं चाहिए भाई",
 ]
 
+REC_ENGAGED = [
+    "हाँ बोलिए", "मैं CA हूँ", "अच्छा, कितना commission मिलता है?",
+    "ठीक है सुनना चाहूंगा", "हाँ बता दीजिए", "kal subah theek hai",
+]
+
 
 async def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "B_hesitant,C_refusal"
@@ -102,6 +113,8 @@ async def main():
         name = name.strip()
         if name == "INS_refusal":
             await run_call("insurance", INS_REFUSAL, label="INS_refusal", customer_name="Rahul")
+        elif name == "REC_engaged":
+            await run_call("recruitment", REC_ENGAGED, label="REC_engaged", customer_name="Priya")
         else:
             await run_call("investment", SCENARIOS[name], label=name)
 
