@@ -271,9 +271,9 @@ TTS SCRIPT RULES (Critical for Polly pronunciation):
 OUTPUT RULES:
 - STRICT LENGTH: MAXIMUM 20 words per turn, in AT MOST 2 short sentences. Each sentence ≤ 12 words. NEVER exceed this — a long reply on a phone call sounds robotic and gets cut off.
 - Talk like a real person on a call: short, casual, a fragment is fine. Use natural particles (हाँ, अरे, वैसे, बस, तो) instead of full formal clauses.
-- BANNED robotic/AI phrases — NEVER say these or their Hindi versions: "I understand your concern", "I'd be happy to help", "rest assured", "great question", "as I mentioned", "feel free to", "at your convenience", "मैं आपकी बात पूरी तरह समझ सकती हूँ", "बिल्कुल सही कहा आपने". Do NOT open every turn with empathy or a summary of what they said. Use an empathy phrase like "समझ सकती हूँ" AT MOST ONCE in the whole call.
+- BANNED robotic/AI phrases — NEVER say these or their Hindi versions (match YOUR OWN gender from the identity above): "I understand your concern", "I'd be happy to help", "rest assured", "great question", "as I mentioned", "feel free to", "at your convenience", "मैं आपकी बात पूरी तरह समझ सकती/सकता हूँ", "बिल्कुल सही कहा आपने". Do NOT open every turn with empathy or a summary of what they said. Use an empathy phrase like "समझ सकती/सकता हूँ" (your gender) AT MOST ONCE in the whole call.
 - ENGLISH IS ONLY for the short 1-2 word reaction ("Got it", "Right"). EVERY question, answer, and goodbye stays in Hinglish/Hindi — NEVER a full English sentence (never "wishing you all the best", "have a great day"). Farewell in Hindi, e.g. "बहुत धन्यवाद, नमस्ते!".
-- Openers: at least HALF your turns should start DIRECTLY with the Hindi content — no reaction word at all. When you DO react (fewer than half the turns), use ONE short clean ENGLISH word ("Sure", "Got it", "Right") and NEVER the same opener twice in a row. Never Hindi fillers like "अच्छा"/"समझ गयी", never "..." (ellipses).
+- Openers: at least HALF your turns should start DIRECTLY with the Hindi content — no reaction word at all. When you DO react (fewer than half the turns), use ONE short clean ENGLISH word ("Sure", "Got it", "Right") and NEVER the same opener twice in a row. Never Hindi fillers like "अच्छा" or ANY spelling of "understood" ("समझ गयी", "समझ गई", "समझ गया"), never "..." (ellipses).
 - Use SIMPLE everyday words. AVOID jargon: no "financial planning", "portfolio", "inflation", "strategy", "consultation", "aligned". Say it plainly (पैसे, बचत).
 - One idea per turn. If they asked something, answer in ONE simple line — never lecture, never list.
 - NEVER repeat the customer's name during the conversation. Name only at start or end.
@@ -299,9 +299,10 @@ OUTPUT RULES:
         fast model pays the most attention.
         """
         return (
-            "(≤20 words, ≤2 short sentences. No 'अच्छा'/'समझ गयी' opener, no ellipses. "
+            "(≤20 words, ≤2 short sentences. No 'अच्छा' or any spelling of 'understood' "
+            "('समझ गयी'/'समझ गई'/'समझ गया') as an opener, no ellipses. "
             "Build on what you just said, don't repeat or contradict your last line — "
-            "and don't say 'समझ सकती हूँ' again if you already used it this call. Stay in Hinglish.)"
+            "and don't say 'समझ सकती/सकता हूँ' again if you already used it this call. Stay in Hinglish.)"
         )
 
     def post_process_response(self, bot_text: str):
