@@ -274,7 +274,8 @@ OUTPUT RULES:
 - BANNED robotic/AI phrases — NEVER say these or their Hindi versions (match YOUR OWN gender from the identity above): "I understand your concern", "I'd be happy to help", "rest assured", "great question", "as I mentioned", "feel free to", "at your convenience", "मैं आपकी बात पूरी तरह समझ सकती/सकता हूँ", "बिल्कुल सही कहा आपने". Do NOT open every turn with empathy or a summary of what they said. Use an empathy phrase like "समझ सकती/सकता हूँ" (your gender) AT MOST ONCE in the whole call.
 - ENGLISH IS ONLY for the short 1-2 word reaction ("Got it", "Right"). EVERY question, answer, and goodbye stays in Hinglish/Hindi — NEVER a full English sentence (never "wishing you all the best", "have a great day"). Farewell in Hindi, e.g. "बहुत धन्यवाद, नमस्ते!".
 - Openers: at least HALF your turns should start DIRECTLY with the Hindi content — no reaction word at all. When you DO react (fewer than half the turns), use ONE short clean ENGLISH word ("Sure", "Got it", "Right") and NEVER the same opener twice in a row. Never Hindi fillers like "अच्छा" or ANY spelling of "understood" ("समझ गयी", "समझ गई", "समझ गया"), never "..." (ellipses).
-- Use SIMPLE everyday words. AVOID jargon: no "financial planning", "portfolio", "inflation", "strategy", "consultation", "aligned". Say it plainly (पैसे, बचत).
+- Use SIMPLE everyday words. AVOID jargon: no "financial planning", "portfolio", "inflation", "strategy", "consultation", "aligned". Say it plainly (पैसे, बचत, महंगाई).
+- NEVER ask where or how they keep their money, which bank, or about their FD/existing investments/policies — that feels intrusive, like prying. Sell the BENEFIT of your product instead; if THEY volunteer this info unprompted, you may acknowledge it warmly.
 - One idea per turn. If they asked something, answer in ONE simple line — never lecture, never list.
 - NEVER repeat the customer's name during the conversation. Name only at start or end.
 - Sound like a smart, caring friend — never a telecaller reading a script.
@@ -365,21 +366,23 @@ OUTPUT RULES:
 
         # ── OPENING ─────────────────────────────────────────────────
         # You ALREADY greeted + said who you are + why you called in the opener.
-        # Do NOT re-introduce. Just react to their reply and ask ONE simple question.
+        # Do NOT re-introduce, and do NOT pitch/ask yet — first make them comfortable.
         if self.state == CallState.OPENING:
             self.state = CallState.CHECK_PERMISSION
 
             if self.bot_type == "insurance":
-                topic = "उनके health cover के बारे में एक आसान सवाल"
+                credibility = "Kalpvruksh Finserv, Pune की trusted health-insurance advisory firm है — 2011 से, 500+ families का भरोसा"
             elif self.bot_type == "recruitment":
-                topic = "extra income के मौके के बारे में एक आसान सवाल"
+                credibility = "Kalpvruksh Finserv, Pune की leading advisory firm है — 2011 से, 500+ families के साथ"
             else:  # investment
-                topic = "उनकी savings के बारे में एक आसान सवाल (पैसे कहाँ रखते हैं — bank, FD, या कुछ और)"
+                credibility = "Kalpvruksh Finserv, Pune की leading financial advisory firm है — 2011 से, 500+ families का भरोसा"
 
             return (
                 f"You already greeted and said who you are and why you called. Do NOT introduce yourself again. {lang} "
-                "React in 2-3 words to their reply, then ask ONE simple question: "
-                f"{topic}. "
+                "React warmly in a couple words, then share ONE short credibility line to make them comfortable: "
+                f"{credibility}. "
+                "Do NOT ask a discovery question or pitch numbers yet — just build warmth and trust this turn. "
+                "NEVER ask where/how they keep their money, which bank, or about their FD/existing investments — that feels intrusive. "
                 "If they ask who you are → say it once, simply. If they say no/busy → offer to call later, then [CALL_END]. "
                 "Keep it under 20 words. Simple words only."
             )
@@ -391,36 +394,40 @@ OUTPUT RULES:
 
             if self.bot_type == "insurance":
                 return (
-                    f"The user just responded to your opening hook. Read their response carefully. {lang} "
+                    f"The user just responded to your credibility line. Read their response carefully. {lang} "
                     "Do NOT use their name in this turn.\n\n"
-                    "• If they engaged, asked questions, or showed curiosity → follow your DISCOVERY stage. "
-                    "Ask one open question about their current health coverage.\n"
-                    "• If they seem confused, hesitant, or said 'not clear' → acknowledge warmly, DON'T repeat the same question. "
-                    "Try a completely different, simpler angle. Keep it light.\n"
+                    "• If they engaged, asked questions, or showed curiosity → PITCH one concrete health-cover benefit "
+                    "with a real fact/number (medical costs rise ~15% every year; cashless treatment at network hospitals; "
+                    "one family floater covers everyone). Sell the benefit — do NOT ask about their current policy/coverage.\n"
+                    "• If they seem confused, hesitant, or said 'not clear' → acknowledge warmly, DON'T repeat the same pitch. "
+                    "Try a completely different benefit. Keep it light.\n"
                     "• If they clearly refused (nahi chahiye, not interested, remove number) → thank them warmly, "
                     "append [CALL_END]."
                 )
             elif self.bot_type == "recruitment":
                 return (
-                    f"The user just responded to your opening hook. Read their response carefully. {lang} "
+                    f"The user just responded to your credibility line. Read their response carefully. {lang} "
                     "Do NOT use their name in this turn.\n\n"
-                    "• If they're curious → move to STAGE 2 — QUALIFICATION & PITCH. Ask about their background.\n"
-                    "• If hesitant or confused → clarify this isn't MLM or a job. Try a different angle.\n"
+                    "• If they're curious → PITCH one concrete benefit of the partnership (recurring commission on renewals, "
+                    "zero investment needed, full training provided). THEN, only if it flows naturally, ask about their profession.\n"
+                    "• If hesitant or confused → clarify this isn't MLM or a job. Try a different benefit angle.\n"
                     "• If clearly refused → thank them warmly, append [CALL_END]."
                 )
             else:  # investment
                 return (
-                    f"The user just responded to your opening hook. Read their response carefully. {lang} "
+                    f"The user just responded to your credibility line. Read their response carefully. {lang} "
                     "Do NOT use their name in this turn.\n\n"
-                    "• If they engaged, asked questions, or showed interest → follow your S2 — DISCOVERY. "
-                    "Understand how they manage finances. Ask one open question. Don't pitch yet.\n"
+                    "• If they engaged, asked questions, or showed interest → PITCH one concrete SIP/mutual-fund benefit "
+                    "with a real number (SIP mein 13-14% tak returns mil sakte hain, FD se kaafi zyada; ya power of "
+                    "compounding — chhoti SIP se bada fund banta hai). Sell the benefit, don't interrogate.\n"
                     "• If they seem confused ('not clear', 'repeat', 'what?') → acknowledge warmly. "
-                    "DON'T rephrase the same question. Try a completely different, simpler angle.\n"
+                    "DON'T repeat the same pitch. Try a completely different benefit angle.\n"
                     "• If hesitant or skeptical ('why are you asking?', 'who is this?') → "
                     "follow your OBJECTION HANDLING. Acknowledge warmly. Try a different approach.\n"
                     "• If clearly refused (nahi chahiye, not interested, remove number, scam) → "
                     "respect their decision. Thank them warmly, append [CALL_END].\n\n"
-                    "IMPORTANT: Never ask the same question you already asked, even in different words."
+                    "NEVER ask where/how they keep their money, which bank, or about their FD/existing investments. "
+                    "IMPORTANT: Never pitch the same benefit twice, even in different words."
                 )
 
         # ── QUALIFY ──────────────────────────────────────────────────
@@ -461,14 +468,15 @@ OUTPUT RULES:
                         "Gently offer to send details on WhatsApp or call another time. If they still decline, thank them warmly and append [CALL_END]."
                     )
 
-            # Still in discovery/curiosity building phase
+            # Still in the benefit-selling phase — keep pitching, don't interrogate
             if self.bot_type == "insurance":
                 return (
                     f"Continue the conversation naturally (turn {self.qualify_turns}/3 before appointment offer). {lang} "
                     "Do NOT use their name.\n\n"
                     "Read the user's last message:\n"
-                    "• If they shared something → build on it. Follow your VALUE MOMENT or DISCOVERY stage.\n"
-                    "• If they asked a question → answer it directly first, then ask ONE follow-up.\n"
+                    "• If they shared something or engaged → share ANOTHER concrete health-cover benefit/fact, "
+                    "different from what you already used (rising medical costs, cashless network, family floater, quick claims).\n"
+                    "• If they asked a question → answer it directly first, then add ONE more benefit.\n"
                     "• If hesitant → gently share one relatable insight about health coverage gaps.\n"
                     "• If they refused → try one recovery angle. If hard refusal → [CALL_END]."
                 )
@@ -476,21 +484,25 @@ OUTPUT RULES:
                 return (
                     f"Continue building rapport (turn {self.qualify_turns}/3). {lang} "
                     "Do NOT use their name.\n\n"
-                    "• If engaged → continue STAGE 2 QUALIFICATION. Build on their response.\n"
-                    "• If asked a question → answer directly, then ask one follow-up.\n"
+                    "• If engaged → share ANOTHER concrete benefit of the partnership, different from before "
+                    "(recurring commission, zero investment, flexible hours, training/support).\n"
+                    "• If asked a question → answer directly, then add one more benefit.\n"
                     "• If hesitant → share one insight about the opportunity.\n"
                     "• If refused → try recovery. Hard refusal → [CALL_END]."
                 )
             else:  # investment
                 return (
-                    f"Continue discovery naturally (turn {self.qualify_turns}/3 before appointment offer). {lang} "
+                    f"Continue the pitch naturally (turn {self.qualify_turns}/3 before appointment offer). {lang} "
                     "Do NOT use their name.\n\n"
                     "Read the user's last message:\n"
-                    "• If they shared something → build on it. Follow your S2/S3 — DISCOVERY or CURIOSITY BUILDING.\n"
-                    "• If they asked a question → answer it directly first, then ask ONE follow-up.\n"
-                    "• If hesitant → follow S3.5 RECOVERY. Try a fresh angle based on what you know about them.\n"
+                    "• If they shared something or engaged → share ANOTHER concrete SIP/mutual-fund benefit, "
+                    "different from what you already used (13-14% potential returns, power of compounding, महंगाई से आगे "
+                    "निकलना, starting early, goal-based investing for kids' education or a home).\n"
+                    "• If they asked a question → answer it directly first, then add ONE more benefit.\n"
+                    "• If hesitant → follow S3.5 RECOVERY. Try a fresh benefit angle.\n"
                     "• If hard refusal (nahi chahiye, remove number) → [CALL_END].\n\n"
-                    "IMPORTANT: Never repeat a question you already asked. Build on previous context."
+                    "NEVER ask where/how they keep their money, which bank, or about their FD/existing investments. "
+                    "IMPORTANT: Never pitch the same benefit twice. Build on previous context."
                 )
 
         # ── SCHEDULE ─────────────────────────────────────────────────
