@@ -14,15 +14,13 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from enum import Enum
-from groq import AsyncGroq
 from server.config import config
 
+# Post-call scoring/classification share the same OpenRouter→Groq fallback policy
+# as the live conversation, via the shared llm_client module.
+from server.llm_client import complete as _complete_with_fallback
+
 logger = logging.getLogger(__name__)
-
-groq_client = AsyncGroq(api_key=config.GROQ_API_KEY)
-
-CLASSIFIER_MODEL  = "llama-3.3-70b-versatile"
-CONVERSATION_MODEL = config.LLM_MODEL or "llama-3.3-70b-versatile"
 
 
 # ── State Definitions ──────────────────────────────────────────────
@@ -116,11 +114,8 @@ async def classify_bot_type(category: str) -> str:
         f'Lead category: "{category}"\n\nAnswer:'
     )
     try:
-        res = await groq_client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=10,
+        res = await _complete_with_fallback(
+            [{"role": "user", "content": prompt}], temperature=0.0, max_tokens=10
         )
         result = re.sub(r"[^A-Z]", "", res.choices[0].message.content.strip().upper())
         return {"INVESTMENT": "investment", "INSURANCE": "insurance", "RECRUITMENT": "recruitment"}.get(result, "investment")
@@ -165,11 +160,8 @@ Output JSON:
 {{"score": <0-10>, "category": "<HOT|WARM|COLD|DNC>", "interest": "<hot|warm|cold|dead>", "objection": "<none|busy|has_advisor|not_interested|send_details>", "appointment": "<yes|no>", "summary": "<one line summary>"}}"""
 
     try:
-        res = await groq_client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=200,
+        res = await _complete_with_fallback(
+            [{"role": "user", "content": prompt}], temperature=0.0, max_tokens=200
         )
         raw = re.sub(r"```json|```", "", res.choices[0].message.content.strip()).strip()
         parsed = json.loads(raw)
@@ -274,9 +266,16 @@ TTS SCRIPT RULES (Critical for Polly pronunciation):
 - Financial/English terms → Latin: SIP, mutual funds, savings, insurance, consultation, Kalpvruksh Finserv
 - Founder name in Devanagari: संजीव सुराना — never "Sandeep Khurana" or any other name
 - NEVER transliterate Hindi into Latin script (never write "main", "aap", "achha", "samajh", "sakti")
+- NEVER mix scripts inside ONE word. The brand is ALWAYS full-Latin "Kalpvruksh Finserv" — never "कलpvruksh" or any Devanagari-Latin mash-up.
 
 OUTPUT RULES:
-- HARD LIMIT: 15-20 words per turn. ONE sentence. ONE question. Then STOP.
+- STRICT LENGTH: MAXIMUM 20 words per turn, in AT MOST 2 short sentences. Each sentence ≤ 12 words. NEVER exceed this — a long reply on a phone call sounds robotic and gets cut off.
+- Talk like a real person on a call: short, casual, a fragment is fine. Use natural particles (हाँ, अरे, वैसे, बस, तो) instead of full formal clauses.
+- BANNED robotic/AI phrases — NEVER say these or their Hindi versions: "I understand your concern", "I'd be happy to help", "rest assured", "great question", "as I mentioned", "feel free to", "at your convenience", "मैं आपकी बात पूरी तरह समझ सकती हूँ", "बिल्कुल सही कहा आपने". Do NOT open every turn with empathy or a summary of what they said. Use an empathy phrase like "समझ सकती हूँ" AT MOST ONCE in the whole call.
+- ENGLISH IS ONLY for the short 1-2 word reaction ("Got it", "Right"). EVERY question, answer, and goodbye stays in Hinglish/Hindi — NEVER a full English sentence (never "wishing you all the best", "have a great day"). Farewell in Hindi, e.g. "बहुत धन्यवाद, नमस्ते!".
+- Openers: at least HALF your turns should start DIRECTLY with the Hindi content — no reaction word at all. When you DO react (fewer than half the turns), use ONE short clean ENGLISH word ("Sure", "Got it", "Right") and NEVER the same opener twice in a row. Never Hindi fillers like "अच्छा"/"समझ गयी", never "..." (ellipses).
+- Use SIMPLE everyday words. AVOID jargon: no "financial planning", "portfolio", "inflation", "strategy", "consultation", "aligned". Say it plainly (पैसे, बचत).
+- One idea per turn. If they asked something, answer in ONE simple line — never lecture, never list.
 - NEVER repeat the customer's name during the conversation. Name only at start or end.
 - Sound like a smart, caring friend — never a telecaller reading a script.
 - To end call: append [CALL_END] to your final farewell sentence and nowhere else.
@@ -290,10 +289,19 @@ OUTPUT RULES:
     # ── Helpers ──────────────────────────────────────────────────────
 
     def _hinglish_note(self) -> str:
-        """Brevity + Hinglish reminder injected into every turn instruction."""
+        """Compact recency nudge injected into every turn instruction.
+
+        The FULL rules (brevity, Hinglish script, jargon, no-AI-filler, etc.) already
+        live in the system persona (chat_history[0]), which is resent on every API call —
+        so restating them here in full would be pure duplication within the same call.
+        This is intentionally short: it just re-anchors the single highest-failure-rate
+        constraint (length) plus continuity, right next to the generation point, where a
+        fast model pays the most attention.
+        """
         return (
-            "(Hinglish only — Hindi in Devanagari, English terms in Latin. "
-            "HARD LIMIT: 1 sentence, 15-20 words. ONE question. Then STOP.)"
+            "(≤20 words, ≤2 short sentences. No 'अच्छा'/'समझ गयी' opener, no ellipses. "
+            "Build on what you just said, don't repeat or contradict your last line — "
+            "and don't say 'समझ सकती हूँ' again if you already used it this call. Stay in Hinglish.)"
         )
 
     def post_process_response(self, bot_text: str):
@@ -343,51 +351,36 @@ OUTPUT RULES:
             self.state = CallState.HANGUP
             return f"The call has gone on too long. Thank them genuinely for their time and say goodbye warmly. {lang} Append [CALL_END]."
 
-        # Deterministic Pivot Injection
-        if self.recovery_count >= 2 and not self.has_pivoted and self.bot_type in ("insurance", "investment"):
+        # After repeated hesitation, stop pushing — but NEVER switch to another product/program.
+        # Offer a low-pressure WhatsApp follow-up or callback, then bow out warmly.
+        if self.recovery_count >= 3 and not self.has_pivoted:
             self.has_pivoted = True
             return (
-                f"The customer has refused multiple times. {lang} "
-                "Do NOT exit yet. Pivot entirely — surface the advisory income opportunity angle. "
-                "One sentence, one question. If no engagement after that, exit warmly with [CALL_END]."
+                f"The customer has hesitated several times. {lang} "
+                "Stop pushing. Do NOT switch to any other product, program, or income/partnership pitch. "
+                "Warmly offer to send a few details on WhatsApp or to call another time — ONE short line. "
+                "If they decline, thank them genuinely and append [CALL_END]."
             )
 
         # ── OPENING ─────────────────────────────────────────────────
-        # User just responded to "Namaste Sanjeev ji?" — introduce yourself AND deliver hook in ONE turn
+        # You ALREADY greeted + said who you are + why you called in the opener.
+        # Do NOT re-introduce. Just react to their reply and ask ONE simple question.
         if self.state == CallState.OPENING:
             self.state = CallState.CHECK_PERMISSION
 
             if self.bot_type == "insurance":
-                bot_name = "Aarav"
-                gender_form = "bol raha hoon"
-                hook = (
-                    "Then immediately follow your OPENING & DISCOVERY stage. "
-                    "Ask one engaging question about their healthcare protection. "
-                    "Be consultative, not salesy. Make them think."
-                )
+                topic = "उनके health cover के बारे में एक आसान सवाल"
             elif self.bot_type == "recruitment":
-                bot_name = "Riya"
-                gender_form = "bol rahi hoon"
-                hook = (
-                    "Then immediately follow your STAGE 1 — BUSINESS HOOK. "
-                    "Create curiosity about the business partnership opportunity. "
-                    "Generate a fresh, natural opening."
-                )
+                topic = "extra income के मौके के बारे में एक आसान सवाल"
             else:  # investment
-                bot_name = "Riya"
-                gender_form = "bol rahi hoon"
-                hook = (
-                    "Then immediately follow your S1 — OPENING. "
-                    "Make them think about whether their savings strategy is aligned with rising future costs. "
-                    "Generate a fresh question — never the same phrasing twice. "
-                    "NEVER ask about specific amounts, income, salary, or portfolio value."
-                )
+                topic = "उनकी savings के बारे में एक आसान सवाल (पैसे कहाँ रखते हैं — bank, FD, या कुछ और)"
 
             return (
-                f"The user just responded to your 'Namaste'. {lang} "
-                f"Introduce yourself briefly: 'Main Kalpvruksh Finserv se {bot_name} {gender_form} — Pune की एक leading financial advisory firm.' "
-                f"If they corrected their name, acknowledge it warmly first. "
-                f"{hook}"
+                f"You already greeted and said who you are and why you called. Do NOT introduce yourself again. {lang} "
+                "React in 2-3 words to their reply, then ask ONE simple question: "
+                f"{topic}. "
+                "If they ask who you are → say it once, simply. If they say no/busy → offer to call later, then [CALL_END]. "
+                "Keep it under 20 words. Simple words only."
             )
 
         # ── CHECK_PERMISSION ─────────────────────────────────────────
@@ -443,7 +436,8 @@ OUTPUT RULES:
                         "Read the user's last message:\n"
                         "- If they're still engaged → follow your MICRO-COMMITMENT stage. "
                         "Offer a free, independent review with हमारे Founder संजीव सुराना (15+ years experience). If they agree, ask which day works.\n"
-                        "- If they pushed back or clearly refused → Do NOT exit yet. Pivot entirely — surface the advisory income opportunity angle. One sentence, one question. If no engagement after that, exit warmly with [CALL_END]."
+                        "- If they're hesitant or pushed back → do NOT switch to any other product/program. "
+                        "Gently offer to send details on WhatsApp or call another time. If they still decline, thank them warmly and append [CALL_END]."
                     )
                 elif self.bot_type == "recruitment":
                     return (
@@ -462,7 +456,8 @@ OUTPUT RULES:
                         "- If they're engaged → follow your S5 — APPOINTMENT OFFER. "
                         "Transition naturally to offering a free, short chat with हमारे Founder संजीव सुराना (15+ years experience). "
                         "If they agree, ask which day works.\n"
-                        "- If they pushed back or clearly refused → Do NOT exit yet. Pivot entirely — surface the advisory income opportunity angle. One sentence, one question. If no engagement after that, exit warmly with [CALL_END]."
+                        "- If they're hesitant or pushed back → do NOT switch to any other product/program. "
+                        "Gently offer to send details on WhatsApp or call another time. If they still decline, thank them warmly and append [CALL_END]."
                     )
 
             # Still in discovery/curiosity building phase
@@ -528,4 +523,7 @@ OUTPUT RULES:
 
         # ── HANGUP ───────────────────────────────────────────────────
         else:
-            return f"The call is ending. Say a warm, genuine goodbye. {lang} Append [CALL_END]."
+            return (
+                f"The call is ending. Say a warm, genuine goodbye IN HINDI "
+                f"(e.g. \"बहुत धन्यवाद, नमस्ते!\") — never an English sign-off. {lang} Append [CALL_END]."
+            )
