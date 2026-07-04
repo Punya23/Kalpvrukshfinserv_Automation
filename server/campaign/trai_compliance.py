@@ -4,6 +4,7 @@ Enforces legal calling hours, optimal time windows, and lead deduplication.
 """
 
 import logging
+import re
 from datetime import datetime, time
 from pathlib import Path
 from typing import Optional
@@ -105,11 +106,10 @@ def get_already_called_phones(call_logs_dir: str = "data/call_logs") -> set:
             data = json.loads(log_file.read_text(encoding="utf-8"))
             phone = data.get("phone", "")
             if phone:
-                # Normalize: strip +91, spaces, dashes
-                clean = phone.replace("+", "").replace(" ", "").replace("-", "").strip()
-                if clean.startswith("91") and len(clean) > 10:
-                    clean = clean[2:]  # Remove country code
-                called.add(clean)
+                # Use the shared normalizer so dedup keys match the dial path
+                clean = normalize_phone(phone)
+                if clean:
+                    called.add(clean)
         except Exception:
             continue
 
@@ -118,11 +118,186 @@ def get_already_called_phones(call_logs_dir: str = "data/call_logs") -> set:
 
 
 def normalize_phone(phone: str) -> str:
-    """Normalize an Indian phone number to 10-digit format for dedup comparison."""
-    clean = phone.replace("+", "").replace(" ", "").replace("-", "").strip()
-    if clean.startswith("91") and len(clean) > 10:
-        clean = clean[2:]
-    return clean
+    """Normalize an Indian phone number to bare 10-digit format for dedup comparison.
+
+    Handles messy inputs like '+9108087594750' (a stray leading 0 after the
+    country code), '08087594750', '918087594750', spaces/dashes, etc.
+    Always returns the last 10 significant digits, e.g. '8087594750'.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+    # Strip the 91 country code when present (handles 11+ digit strings)
+    if digits.startswith("91") and len(digits) > 10:
+        digits = digits[2:]
+    # Strip any leading zeros (STD-format numbers like 08087594750)
+    digits = digits.lstrip("0")
+    # Return the last 10 digits (guards against any remaining prefix junk)
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def to_dial_format(phone: str) -> str:
+    """Return an E.164 dial string ('+91XXXXXXXXXX') for a valid Indian mobile.
+
+    Returns an empty string if the number can't be normalized to 10 digits,
+    so callers can skip invalid leads instead of dialing garbage.
+    """
+    ten = normalize_phone(phone)
+    return f"+91{ten}" if len(ten) == 10 else ""
+
+
+# -------------------------------------------------------
+# Per-Lead Attempt Ledger
+# -------------------------------------------------------
+ATTEMPTS_FILE = Path("data/call_attempts.json")
+
+
+def get_attempt_counts(attempts_file: Path = ATTEMPTS_FILE) -> dict:
+    """Return {normalized_phone: attempt_count} from the ledger."""
+    if not attempts_file.exists():
+        return {}
+    try:
+        data = json.loads(attempts_file.read_text(encoding="utf-8"))
+        out = {}
+        for k, v in data.items():
+            out[k] = int(v.get("attempts", 0)) if isinstance(v, dict) else int(v)
+        return out
+    except Exception as e:
+        logger.error(f"Error reading attempts ledger: {e}")
+        return {}
+
+
+def record_attempt(phone: str, outcome: str = "", attempts_file: Path = ATTEMPTS_FILE) -> int:
+    """Increment the attempt count for a number and return the new total.
+
+    Called once per placed call (any outcome). No-answer/busy/failed calls don't
+    write a transcript, so this ledger is what eventually caps their retries.
+    """
+    num = normalize_phone(phone)
+    if len(num) != 10:
+        return 0
+    try:
+        attempts_file.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if attempts_file.exists():
+            try:
+                data = json.loads(attempts_file.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        entry = data.get(num) or {}
+        if not isinstance(entry, dict):
+            entry = {"attempts": int(entry)}
+        entry["attempts"] = int(entry.get("attempts", 0)) + 1
+        entry["last_outcome"] = outcome
+        entry["last_attempt"] = datetime.now().isoformat()
+        data[num] = entry
+        attempts_file.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return entry["attempts"]
+    except Exception as e:
+        logger.error(f"Error recording attempt: {e}")
+        return 0
+
+
+def filter_by_attempt_cap(
+    leads: list[dict], max_attempts: int = 3, attempts_file: Path = ATTEMPTS_FILE
+) -> list[dict]:
+    """Drop leads whose number has already been dialed >= max_attempts times."""
+    if max_attempts <= 0:
+        return leads
+    counts = get_attempt_counts(attempts_file)
+    kept, capped = [], 0
+    for lead in leads:
+        num = normalize_phone(lead.get("phone", ""))
+        if counts.get(num, 0) >= max_attempts:
+            capped += 1
+            continue
+        kept.append(lead)
+    if capped:
+        logger.info(
+            f"Attempt cap ({max_attempts}): removed {capped} maxed-out lead(s), "
+            f"{len(kept)} remain."
+        )
+    return kept
+
+
+# -------------------------------------------------------
+# DND / Do-Not-Call List
+# -------------------------------------------------------
+DND_FILE = Path("data/dnd_list.csv")
+
+
+def get_dnd_set(dnd_file: Path = DND_FILE) -> set:
+    """Return the set of DND phone numbers (normalized to 10 digits).
+
+    The file is a CSV with a 'phone' column; comment lines (starting with '#')
+    and blank/invalid rows are ignored. Never dial anything in this set.
+    """
+    dnd: set = set()
+    if not dnd_file.exists():
+        return dnd
+
+    try:
+        with open(dnd_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # First comma-separated field is the phone number
+                raw = line.split(",")[0].strip()
+                if raw.lower() == "phone":  # header row
+                    continue
+                num = normalize_phone(raw)
+                if len(num) == 10:
+                    dnd.add(num)
+    except Exception as e:
+        logger.error(f"Error reading DND list: {e}")
+
+    if dnd:
+        logger.info(f"Loaded {len(dnd)} DND numbers.")
+    return dnd
+
+
+def add_to_dnd(phone: str, reason: str = "", dnd_file: Path = DND_FILE) -> bool:
+    """Append a number to the DND list if not already present.
+
+    Returns True if a new entry was written. Safe to call repeatedly.
+    Used to honour a caller's request to not be contacted (DNC outcome).
+    """
+    num = normalize_phone(phone)
+    if len(num) != 10:
+        return False
+    if num in get_dnd_set(dnd_file):
+        return False  # already listed
+    try:
+        from datetime import date
+        dnd_file.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not dnd_file.exists()
+        with open(dnd_file, "a", encoding="utf-8") as f:
+            if new_file:
+                f.write("phone,reason,date_added\n")
+            # Store in +91 form for human readability; loader re-normalizes anyway
+            f.write(f"+91{num},{reason},{date.today().isoformat()}\n")
+        logger.info(f"Added {num} to DND list (reason: {reason or 'n/a'}).")
+        return True
+    except Exception as e:
+        logger.error(f"Error adding to DND list: {e}")
+        return False
+
+
+def scrub_dnd(leads: list[dict], dnd_file: Path = DND_FILE) -> list[dict]:
+    """Remove any lead whose phone number is on the DND list."""
+    dnd = get_dnd_set(dnd_file)
+    if not dnd:
+        return leads
+    kept, removed = [], 0
+    for lead in leads:
+        if normalize_phone(lead.get("phone", "")) in dnd:
+            removed += 1
+            continue
+        kept.append(lead)
+    if removed:
+        logger.info(f"DND scrub: removed {removed} lead(s), {len(kept)} remain.")
+    return kept
 
 
 def deduplicate_leads(leads: list[dict], call_logs_dir: str = "data/call_logs") -> list[dict]:

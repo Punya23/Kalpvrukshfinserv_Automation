@@ -23,10 +23,9 @@ requests==2.32.3
 # --- Scheduling ---
 apscheduler==3.11.0
 
-# --- Voice AI (Twilio / Custom) ---
+# --- Voice AI (Exotel / Custom) ---
 websockets>=11.0.3
 boto3>=1.34.0
-twilio>=9.0.0
 
 # --- Voice AI (Vapi) ---
 # vapi-python (install separately if using Vapi SDK)

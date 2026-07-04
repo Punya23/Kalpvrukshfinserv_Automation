@@ -7,9 +7,8 @@ from pathlib import Path
 from datetime import datetime
 import websockets
 import boto3
-from groq import AsyncGroq
 from server.config import config
-from server.audio_utils import pcm_to_mulaw, chunk_pcm
+from server.audio_utils import chunk_pcm
 from server.voice_state_machine import CallState, VoiceStateMachine, classify_bot_type, score_lead_with_llm
 
 logger = logging.getLogger(__name__)
@@ -37,6 +36,80 @@ def _append_to_qa_csv(call_log: dict):
     except Exception as e:
         logger.error(f"Failed to append to QA CSV: {e}")
 
+
+# ── Spoken-text guards ─────────────────────────────────────────────────────
+# The prompt asks the LLM for short, human replies, but a 70B model at temp 0.5
+# regularly overshoots. These guards enforce brevity + kill AI-chatbot filler in
+# Python — the ONLY reliable place — right before the text reaches Polly TTS.
+
+# Sentence boundary: Hindi danda plus the Latin terminators.
+_SENTENCE_END = re.compile(r'(?<=[।.!?])\s+')
+
+# English "AI assistant" filler that instantly makes the bot sound like a chatbot,
+# not a person on the phone. Stripped wholesale (Hindi equivalents are handled in
+# the prompt, which is the better lever for Devanagari).
+_AI_ISH_PATTERNS = [
+    (re.compile(r"\bI(?:'m| am)?\s+(?:completely |totally |fully |absolutely )?(?:understand|here to help)\b[^.।!?]*[.।!?]?\s*", re.I), ""),
+    (re.compile(r"\bI(?:'| a|'?d)?\s*(?:would |'d )?be (?:more than )?happy to\b\s*", re.I), ""),
+    (re.compile(r"\b(?:please )?feel free to\b\s*", re.I), ""),
+    (re.compile(r"\brest assured\b[,.]?\s*", re.I), ""),
+    (re.compile(r"\bas (?:I|we) (?:mentioned|discussed) (?:earlier|before)?\b[,.]?\s*", re.I), ""),
+    (re.compile(r"\bthat(?:'s| is) a (?:great|good|wonderful|excellent) question\b[,.!]?\s*", re.I), ""),
+    (re.compile(r"\bI hope (?:this|that) helps\b[,.!]?\s*", re.I), ""),
+    (re.compile(r"\bat your convenience\b", re.I), "jab aapko time ho"),
+]
+
+
+def _strip_ai_ish(text: str) -> str:
+    """Remove canned assistant filler that makes the voice sound robotic."""
+    for pat, repl in _AI_ISH_PATTERNS:
+        text = pat.sub(repl, text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _shorten_for_voice(text: str, max_words: int = 26) -> str:
+    """Hard brevity guard for TTS output.
+
+    - Keeps whole sentences up to `max_words`, so we never cut mid-sentence.
+    - Drops a trailing fragment with no terminator (a telltale LLM token cutoff)
+      as long as at least one complete sentence remains.
+    - Falls back to a clean word-boundary cut for a single run-on sentence.
+    """
+    text = text.strip()
+    if not text or len(text.split()) <= max_words:
+        return text
+
+    sentences = [s.strip() for s in _SENTENCE_END.split(text) if s.strip()]
+    if len(sentences) > 1 and sentences[-1][-1:] not in "।.!?":
+        sentences = sentences[:-1]
+
+    kept, count = [], 0
+    for s in sentences:
+        w = len(s.split())
+        if kept and count + w > max_words:
+            break
+        kept.append(s)
+        count += w
+    result = " ".join(kept).strip()
+
+    # A single sentence still over the cap → clean cut at the word boundary.
+    if not result or len(result.split()) > max_words:
+        result = " ".join((result or text).split()[:max_words]).rstrip(" ,;:—-")
+        if result and result[-1] not in "।.!?":
+            result += "।"
+    return result
+
+
+def _clean_speak_text(bot_text: str) -> str:
+    """Strip control tags, remove AI-ish filler, and hard-cap length for TTS."""
+    t = re.sub(r"\[(?:CALL[\s_]*END|END[\s_]*CALL)\]", "", bot_text, flags=re.IGNORECASE)
+    t = t.replace("[HANG_UP]", "").replace("[RECOVERY]", "")
+    t = re.sub(r"\[APPOINTMENT:.*?\]", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\[LEAD:.*?\]", "", t, flags=re.IGNORECASE)
+    t = _strip_ai_ish(t.strip())
+    return _shorten_for_voice(t).strip()
+
+
 # Initialize AWS Polly Client
 polly_client = boto3.client(
     "polly",
@@ -45,577 +118,16 @@ polly_client = boto3.client(
     region_name=config.AWS_REGION
 )
 
-# Initialize Groq Client with persistent connection pool
-# Without this, each turn creates a new TCP+TLS connection (~4-8s on home WiFi).
-# With this, the first call opens the connection and subsequent calls reuse it (~0ms).
-import httpx as _httpx
-_groq_http_client = _httpx.AsyncClient(
-    limits=_httpx.Limits(
-        max_connections=5,
-        max_keepalive_connections=2,
-        keepalive_expiry=120,       # Keep connection alive for 2 minutes between turns
-    ),
-    timeout=_httpx.Timeout(30.0, connect=10.0),  # 10s connect, 30s total
-)
-groq_client = AsyncGroq(api_key=config.GROQ_API_KEY, http_client=_groq_http_client)
-
-
-class VoiceConnectionManager:
-    def __init__(self, twilio_ws):
-        self.twilio_ws = twilio_ws
-        self.stream_sid = None
-        self.deepgram_ws = None
-        self.transcription_buffer = ""
-        self.is_bot_speaking = False
-        self.call_ended = False
-        self.welcome_interrupted = False  # Barge-in flag for welcome message
-        self.barge_in_transcript = ""
-        self._deepgram_reconnect_count = 0
-        self.last_speak_finished_time = 0.0
-        self.agent_voice = "Kajal"
-        self.agent_lang = "hi-IN"
-        self.customer_category = ""
-        
-        self.state_machine = None
-
-    async def _determine_bot_persona(self, start_data: dict):
-        """
-        Dynamically determine and load the correct system prompt, agent name, and voice
-        based on the target client's phone number or category.
-        """
-        # In Twilio, the metadata is inside start_data.customParameters or we look up caller/callee details
-        # Exotel has 'to' and 'from' at start. Twilio customParameters can be passed, or we look up by stream parameters.
-        # Twilio starts have: 'customParameters', 'to', 'from', etc.
-        phone = start_data.get("to") or start_data.get("from") or ""
-        custom_params = start_data.get("customParameters", {})
-        
-        # If bot_type is directly passed as a parameter (e.g. from WhatsApp API call initiation)
-        bot_type = custom_params.get("bot_type") or "investment"
-        customer_name = custom_params.get("customer_name") or ""
-        customer_category = custom_params.get("customer_category") or custom_params.get("category") or ""
-        
-        clean_phone = phone.replace("+", "").replace(" ", "").replace("-", "").strip()
-        
-        # If no explicit parameter was passed, lookup by phone number in scraped leads database
-        lead_files = [
-            Path("data/leads/hni_leads_pune.csv"),
-            Path("data/leads/unified_compliant_leads.csv")
-        ]
-        for leads_file in lead_files:
-            if leads_file.exists() and clean_phone and not customer_name:
-                try:
-                    import csv
-                    with open(leads_file, "r", encoding="utf-8") as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            row_phone = row.get("phone", "").replace("+", "").replace(" ", "").replace("-", "").strip()
-                            if row_phone and (row_phone in clean_phone or clean_phone in row_phone):
-                                customer_name = row.get("name", "").strip()
-                                customer_category = (row.get("category", "") or row.get("profession", "")).strip()
-                                break
-                except Exception as e:
-                    logger.error(f"Error reading leads file: {e}")
-                
-        # Perform LLM classification on category if we have a category
-        if customer_category:
-            bot_type = await classify_bot_type(customer_category)
-            logger.info(f"Classified lead category '{customer_category}' -> Bot Type: {bot_type}")
-
-        # Set agent voice and language
-        self.agent_voice = "Kajal"
-        self.agent_lang = "hi-IN"
-            
-        self.bot_type = bot_type
-        self.customer_name = customer_name
-        self.caller_phone = clean_phone
-        self.customer_category = customer_category
-        self.state_machine = VoiceStateMachine(
-            bot_type=bot_type, 
-            customer_name=customer_name, 
-            customer_category=customer_category
-        )
-        self.crm_context = {"profession": "", "city": "Pune"}
-        logger.info(f"Active Persona State Machine | Voice: {self.agent_voice} | Target Client: {customer_name} | Category: {customer_category}")
-
-    async def connect_to_deepgram(self):
-        """Establish WebSocket connection to Deepgram for live STT."""
-        deepgram_url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&language=hi&model=nova-2&endpointing=300"
-        
-        headers = {
-            "Authorization": f"Token {config.DEEPGRAM_API_KEY}"
-        }
-        
-        try:
-            self.deepgram_ws = await websockets.connect(deepgram_url, additional_headers=headers)
-            self._deepgram_reconnect_count = 0
-            logger.info("Connected to Deepgram STT.")
-            # Start background task to receive Deepgram transcripts
-            asyncio.create_task(self.receive_from_deepgram())
-            # Start keepalive task
-            asyncio.create_task(self.deepgram_keepalive())
-        except Exception as e:
-            logger.error(f"Failed to connect to Deepgram: {e}")
-
-    async def deepgram_keepalive(self):
-        """Send periodic KeepAlive messages to Deepgram to prevent timeout."""
-        try:
-            while self.deepgram_ws:
-                await asyncio.sleep(5)
-                if self.deepgram_ws:
-                    logger.debug("Sending KeepAlive to Deepgram")
-                    await self.deepgram_ws.send(json.dumps({"type": "KeepAlive"}))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"Error in Deepgram KeepAlive: {e}")
-
-    async def receive_from_deepgram(self):
-        """Listen for transcripts from Deepgram."""
-        if not self.deepgram_ws:
-            return
-            
-        try:
-            async for message in self.deepgram_ws:
-                data = json.loads(message)
-                logger.debug(f"DG Raw: {message[:100]}")
-                
-                # Check for transcript results
-                if data.get("type") == "Results":
-                    channel = data.get("channel", {})
-                    alts = channel.get("alternatives", [])
-                    if alts:
-                        transcript = alts[0].get("transcript", "").strip()
-                        
-                        # Clean punctuation
-                        clean_transcript = re.sub(r'^[.,\s!?]+|[.,\s!?]+$', '', transcript).strip()
-                        
-                        # Trigger response only when user finishes a sentence (endpointing)
-                        if clean_transcript and (data.get("is_final") or data.get("speech_final")):
-                            logger.info(f"User: {clean_transcript}")
-                            
-                            now = asyncio.get_event_loop().time()
-                            cooldown_elapsed = now - self.last_speak_finished_time
-                            
-                            if self.is_bot_speaking:
-                                if getattr(self, 'state_machine', None) and self.state_machine.state == CallState.HANGUP:
-                                    logger.info(f"Ignoring barge-in '{clean_transcript}' because call is in final goodbye.")
-                                    continue
-                                
-                                # Barge-in: if user speaks during welcome/bot, interrupt it
-                                self.welcome_interrupted = True
-                                self.barge_in_transcript = clean_transcript
-                                logger.info(f"User barged in with '{clean_transcript}' — interrupting bot.")
-                                continue
-                                
-                            if cooldown_elapsed < 1.2:
-                                logger.info(f"Ignoring transcript '{clean_transcript}' due to echo cooldown ({cooldown_elapsed:.2f}s < 1.2s).")
-                                continue
-                                
-                            self.is_bot_speaking = True
-                            asyncio.create_task(self.process_llm_and_speak(clean_transcript))
-        except Exception as e:
-            logger.error(f"Deepgram receive error: {e}")
-        finally:
-            self.deepgram_ws = None
-            if not self.call_ended and self._deepgram_reconnect_count < 2:
-                self._deepgram_reconnect_count += 1
-                logger.warning(f"Deepgram connection dropped — reconnect attempt {self._deepgram_reconnect_count}/2")
-                try:
-                    await self.connect_to_deepgram()
-                except Exception as e:
-                    logger.error(f"Deepgram reconnect failed: {e}")
-            elif not self.call_ended:
-                logger.error("Deepgram reconnect limit reached — bot is deaf for remainder of call")
-
-    async def process_llm_and_speak(self, user_text: str):
-        """Pass user text to Groq, then to Polly, then back to Twilio."""
-        if self.call_ended:
-            return
-        self.is_bot_speaking = True
-        
-        if not hasattr(self, 'state_machine') or self.state_machine is None:
-            self.state_machine = VoiceStateMachine(
-                bot_type=getattr(self, 'bot_type', 'investment'), 
-                customer_name=getattr(self, 'customer_name', ''), 
-                customer_category=getattr(self, 'customer_category', '')
-            )
-
-        try:
-            # 1. Update history with the user input
-            self.state_machine.chat_history.append({"role": "user", "content": user_text})
-            self.state_machine.full_transcript.append({"role": "user", "content": user_text})
-
-            # Keep history manageable — system prompt + last 10 messages
-            if len(self.state_machine.chat_history) > 12:
-                self.state_machine.chat_history = (
-                    [self.state_machine.chat_history[0]]  # system prompt
-                    + self.state_machine.chat_history[-10:]  # recent context
-                )
-
-            instruction = self.state_machine.get_instruction_for_current_state(user_text=user_text)
-            
-            call_is_ending = False
-
-            if self.state_machine.state == CallState.HANGUP and instruction.startswith("The call has gone on too long"):
-                bot_text = "माफ़ कीजिएगा, यह call काफी लंबी हो गई है। मैं आपको बाद में कॉल करूँगी। [CALL_END]"
-                self.state_machine.chat_history.append({"role": "assistant", "content": bot_text})
-                self.state_machine.full_transcript.append({"role": "assistant", "content": bot_text})
-                logger.info(f"Bot (Max Turns): {bot_text}")
-                call_is_ending = True
-            else:
-                messages = list(self.state_machine.chat_history)
-                messages.append({"role": "system", "content": instruction})
-
-                # 2. Get LLM Response from Groq (with 1 retry on transient errors)
-                bot_text = None
-                for attempt in range(2):
-                    try:
-                        response = await groq_client.chat.completions.create(
-                            model=config.LLM_MODEL or "llama-3.3-70b-versatile",
-                            messages=messages,
-                            temperature=0.3,
-                            max_tokens=150
-                        )
-                        bot_text = response.choices[0].message.content.strip()
-                        break  # Success
-                    except Exception as llm_err:
-                        if attempt == 0:
-                            logger.warning(f"LLM attempt 1 failed: {llm_err}. Retrying in 1s...")
-                            await asyncio.sleep(1.0)
-                        else:
-                            raise  # Let outer except handle it
-
-                self.state_machine.chat_history.append({
-                    "role": "assistant",
-                    "content": bot_text
-                })
-                self.state_machine.full_transcript.append({"role": "assistant", "content": bot_text})
-                logger.info(f"Bot: {bot_text}")
-
-                # Post-process: let state machine parse tags and transition
-                self.state_machine.post_process_response(bot_text)
-
-                if "[CALL_END]" in bot_text or self.state_machine.state == CallState.HANGUP:
-                    call_is_ending = True
-                    self.state_machine.state = CallState.HANGUP
-            
-            speak_text = re.sub(r'\[(?:CALL[\s_]*END|END[\s_]*CALL)\]', '', bot_text, flags=re.IGNORECASE).strip()
-            speak_text = speak_text.replace("[HANG_UP]", "").strip()
-            speak_text = speak_text.replace("[RECOVERY]", "").strip()
-            speak_text = re.sub(r'\[APPOINTMENT:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
-            speak_text = re.sub(r'\[LEAD:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
-
-            if speak_text:
-                # Convert Text to Speech using AWS Polly
-                is_ssml = speak_text.strip().startswith("<speak>") and speak_text.strip().endswith("</speak>")
-                if is_ssml:
-                    polly_text = speak_text
-                else:
-                    # Auto-wrap in SSML with natural pauses for LLM output
-                    ssml_text = speak_text
-                    ssml_text = ssml_text.replace("...", '<break time="350ms"/>')
-                    ssml_text = ssml_text.replace("।", '।<break time="250ms"/>')
-                    polly_text = f"<speak>{ssml_text}</speak>"
-
-                polly_response = polly_client.synthesize_speech(
-                    Text=polly_text,
-                    TextType="ssml",
-                    OutputFormat="pcm",
-                    SampleRate="8000",
-                    VoiceId=self.agent_voice,
-                    LanguageCode=self.agent_lang,
-                    Engine="neural"
-                )
-                
-                # Read PCM audio stream from Polly
-                audio_stream = polly_response.get("AudioStream")
-                if audio_stream:
-                    pcm_data = audio_stream.read()
-                    
-                    # Convert PCM to mulaw base64
-                    mulaw_b64 = pcm_to_mulaw(pcm_data)
-                    
-                    # Send to Twilio
-                    payload = {
-                        "event": "media",
-                        "streamSid": self.stream_sid,
-                        "media": {
-                            "payload": mulaw_b64
-                        }
-                    }
-                    await self.twilio_ws.send_json(payload)
-                    
-            if call_is_ending:
-                logger.info(f"Twilio Call Ending triggered — scoring lead and closing socket.")
-                await self._score_and_log_lead()
-                await asyncio.sleep(2.0)
-                self.call_ended = True
-                await self.twilio_ws.close()
-                
-        except Exception as e:
-            logger.error(f"Error in LLM/TTS pipeline: {e}")
-        finally:
-            self.last_speak_finished_time = 0.0 if self.welcome_interrupted else asyncio.get_event_loop().time()
-            self.is_bot_speaking = False
-            
-            if hasattr(self, 'barge_in_transcript') and self.barge_in_transcript and not self.call_ended:
-                transcript_to_process = self.barge_in_transcript
-                self.barge_in_transcript = ""
-                asyncio.create_task(self.process_llm_and_speak(transcript_to_process))
-                
-            self.welcome_interrupted = False
-
-    async def _score_and_log_lead(self):
-        """LLM-based lead scoring + CRM logging (Twilio)."""
-        try:
-            from server.lead_scoring import LeadData, BotType, LeadSource, LeadCategory
-            from server.sheets_manager import sheets_manager, whatsapp_notifier
-
-            if not self.state_machine:
-                return
-
-            # Build transcript
-            transcript_lines = []
-            for m in self.state_machine.full_transcript:
-                if m['role'] in ('user', 'assistant'):
-                    role = m['role']
-                    content = m['content']
-                    if role == 'assistant':
-                        try:
-                            parsed = json.loads(content)
-                            content = parsed.get("response") or parsed.get("reply") or parsed.get("text") or content
-                        except Exception:
-                            pass
-                    transcript_lines.append(f"{role}: {content}")
-            transcript = "\n".join(transcript_lines)
-
-            scheduled_day = self.state_machine.scheduled_day
-            scheduled_time = self.state_machine.scheduled_time
-
-            # Determine outcome from state machine
-            if scheduled_day and scheduled_time:
-                outcome = "callback_scheduled"
-            elif scheduled_day:
-                outcome = "callback_agreed"
-            else:
-                outcome = "completed"
-
-            # LLM-based scoring (happens AFTER call, no customer-facing latency)
-            bot_type_str = getattr(self, 'bot_type', 'investment')
-            llm_score = await score_lead_with_llm(transcript, bot_type_str)
-            logger.info(f"[Twilio] LLM Score: {llm_score}")
-
-            # Build LeadData with LLM results
-            category_map = {"HOT": LeadCategory.HOT, "WARM": LeadCategory.WARM, "COLD": LeadCategory.COLD, "DNC": LeadCategory.DNC}
-            bot_type_map = {"investment": BotType.INVESTMENT, "insurance": BotType.INSURANCE, "recruitment": BotType.RECRUITMENT}
-            lead = LeadData(
-                name=getattr(self, 'customer_name', ''),
-                phone=getattr(self, 'caller_phone', ''),
-                conversation_summary=llm_score.get("summary", transcript[:500]),
-                source=LeadSource.OUTBOUND_CALL,
-                bot_type=bot_type_map.get(bot_type_str, BotType.INVESTMENT),
-                score=llm_score["score"],
-                category=category_map.get(llm_score["category"], LeadCategory.COLD),
-            )
-
-            # Save full transcript to disk
-            try:
-                call_log_dir = Path("data/call_logs")
-                call_log_dir.mkdir(parents=True, exist_ok=True)
-                call_log = {
-                    "timestamp": datetime.now().isoformat(),
-                    "phone": getattr(self, 'caller_phone', ''),
-                    "customer_name": getattr(self, 'customer_name', ''),
-                    "customer_category": getattr(self, 'customer_category', ''),
-                    "bot_type": bot_type_str,
-                    "outcome": outcome,
-                    "scheduled_day": scheduled_day,
-                    "scheduled_time": scheduled_time,
-                    "lead_score": lead.score,
-                    "lead_category": lead.category.value,
-                    "llm_interest": llm_score.get("interest", ""),
-                    "llm_objection": llm_score.get("objection", ""),
-                    "llm_summary": llm_score.get("summary", ""),
-                    "full_transcript": transcript,
-                }
-                log_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{getattr(self, 'caller_phone', 'unknown')[-4:]}.json"
-                log_path = call_log_dir / log_filename
-                log_path.write_text(json.dumps(call_log, indent=2, ensure_ascii=False), encoding="utf-8")
-                logger.info(f"[Twilio] Call transcript saved: {log_path}")
-                _append_to_qa_csv(call_log)
-                logger.info(f"[Twilio] Appended to QA CSV log")
-            except Exception as e:
-                logger.error(f"[Twilio] Failed to save transcript to disk: {e}")
-
-            if lead.category == LeadCategory.HOT:
-                sheets_manager.log_hot_lead(lead, scheduled_day=scheduled_day, scheduled_time=scheduled_time)
-                await whatsapp_notifier.notify_manager_hot_lead(lead, scheduled_day=scheduled_day, scheduled_time=scheduled_time)
-                logger.info(f"[Twilio] 🔴 HOT LEAD logged: {lead.name or 'Unknown'} (Score: {lead.score})")
-            elif lead.category == LeadCategory.WARM:
-                sheets_manager.log_nurture_lead(lead)
-                logger.info(f"[Twilio] 🟡 WARM LEAD logged: {lead.name or 'Unknown'} (Score: {lead.score})")
-            else:
-                logger.info(f"[Twilio] ⚪ {lead.category.value} lead: Score {lead.score}")
-        except Exception as e:
-            logger.error(f"[Twilio] Error scoring/logging lead: {e}")
-
-    async def play_welcome_message(self, customer_name: str, bot_type: str):
-        """Play the opening welcome message immediately without calling Groq first, reducing latency.
-        Uses SSML for natural pauses between phrases.
-        """
-        if not hasattr(self, 'state_machine') or self.state_machine is None:
-            self.state_machine = VoiceStateMachine(
-                bot_type=bot_type, 
-                customer_name=customer_name, 
-                customer_category=getattr(self, 'customer_category', '')
-            )
-
-        def generate_welcome_message(b_type: str, c_name: str, crm_context: dict = None) -> str:
-            ctx = crm_context or {}
-            profession    = ctx.get("profession", "")
-            business_name = ctx.get("business_name", "")
-            city          = ctx.get("city", "Pune")
-            gender        = ctx.get("gender", "M")
-
-            # ── Salutation ──────────────────────────────────
-            if business_name:
-                greeting_line = f'Namaste, <break time="150ms"/> क्या यह {business_name} है?'
-            else:
-                _BUSINESS_SIGNALS = {
-                    "pvt", "ltd", "llp", "inc", "corp", "limited",
-                    "clinic", "hospital", "pharmacy", "medical", "dental", "lab",
-                    "dr", "dr.", "doctor", "centre", "center",
-                    "enterprise", "enterprises", "traders", "trading", "agency",
-                    "store", "shop", "mart", "school", "college", "institute", "foundation", "trust",
-                    "associates", "works", "care", "studio"
-                }
-                name_lower = c_name.lower() if c_name else ""
-                tokens = name_lower.replace(".", " ").split()
-                is_business = bool(set(tokens) & _BUSINESS_SIGNALS)
-                if is_business:
-                    greeting_line = f'Namaste, <break time="150ms"/> क्या यह {c_name} है?'
-                else:
-                    greeting_line = f'Namaste {c_name} ji? <break time="150ms"/>' if c_name else f'Namaste? <break time="150ms"/>'
-
-            # Name Verification Check: Just return the greeting, don't include the hook.
-            # We add a slight interrogative pause so they respond.
-            return f'<speak>{greeting_line}</speak>'
-
-        welcome_text = generate_welcome_message(bot_type, customer_name, getattr(self, "crm_context", {}))
-                
-        self.state_machine.state = CallState.OPENING
-        # Clean SSML tags for chat history
-        clean_welcome = welcome_text
-        clean_welcome = re.sub(r'<[^>]+>', '', clean_welcome)
-        clean_welcome = re.sub(r'\s+', ' ', clean_welcome).strip()
-        self.state_machine.chat_history.append({"role": "assistant", "content": clean_welcome})
-        self.state_machine.full_transcript.append({"role": "assistant", "content": clean_welcome})
-        
-        logger.info(f"Welcoming customer directly: {welcome_text}")
-        
-        self.is_bot_speaking = True
-        try:
-            polly_response = polly_client.synthesize_speech(
-                Text=welcome_text,
-                TextType="ssml",
-                OutputFormat="pcm",
-                SampleRate="8000",
-                VoiceId=self.agent_voice,
-                LanguageCode=self.agent_lang,
-                Engine="neural"
-            )
-            audio_stream = polly_response.get("AudioStream")
-            if audio_stream:
-                pcm_data = audio_stream.read()
-                # Send in chunks to allow barge-in detection
-                chunk_size = 640  # 640 bytes = 40ms at 8kHz 16-bit
-                for i in range(0, len(pcm_data), chunk_size):
-                    if self.welcome_interrupted or self.call_ended:
-                        logger.info("Welcome message interrupted by user speech.")
-                        break
-                    chunk = pcm_data[i:i + chunk_size]
-                    mulaw_b64 = pcm_to_mulaw(chunk)
-                    payload = {
-                        "event": "media",
-                        "streamSid": self.stream_sid,
-                        "media": {
-                            "payload": mulaw_b64
-                        }
-                    }
-                    await self.twilio_ws.send_json(payload)
-                    await asyncio.sleep(0.04)  # 40ms pacing
-        except Exception as e:
-            logger.error(f"Error playing welcome: {e}")
-        finally:
-            self.last_speak_finished_time = 0.0 if self.welcome_interrupted else asyncio.get_event_loop().time()
-            self.is_bot_speaking = False
-            
-            if hasattr(self, 'barge_in_transcript') and self.barge_in_transcript and not self.call_ended:
-                transcript_to_process = self.barge_in_transcript
-                self.barge_in_transcript = ""
-                asyncio.create_task(self.process_llm_and_speak(transcript_to_process))
-                
-            self.welcome_interrupted = False
-
-    async def handle_twilio_message(self, message: str):
-        """Handle incoming messages from Twilio WebSocket."""
-        data = json.loads(message)
-        event = data.get("event")
-        
-        if event == "connected":
-            logger.info("Twilio WebSocket connected.")
-        elif event == "start":
-            start_payload = data.get("start", {})
-            self.stream_sid = start_payload.get("streamSid")
-            logger.info(f"Stream started. SID: {self.stream_sid} | Payload: {data}")
-            
-            # Dynamically set persona
-            await self._determine_bot_persona(start_payload)
-            
-            await self.connect_to_deepgram()
-            
-            # Trigger welcome message directly in background (bypass Groq)
-            customer_name = getattr(self, 'customer_name', '')
-            bot_type = getattr(self, 'bot_type', 'investment')
-            asyncio.create_task(self.play_welcome_message(customer_name, bot_type))
-            
-        elif event == "media":
-            # Pass audio to Deepgram
-            if self.deepgram_ws:
-                payload = data.get("media", {}).get("payload")
-                if payload:
-                    try:
-                        audio_bytes = base64.b64decode(payload)
-                        await self.deepgram_ws.send(audio_bytes)
-                    except websockets.exceptions.ConnectionClosed as e:
-                        logger.warning(f"Deepgram connection closed while sending media: {e}")
-                        self.deepgram_ws = None
-                    except Exception as e:
-                        logger.error(f"Error sending media to Deepgram: {e}")
-                    
-        elif event == "stop":
-            logger.info("Stream stopped.")
-            # Score and log lead if not already done (e.g. caller hung up)
-            if not self.call_ended and self.state_machine:
-                await self._score_and_log_lead()
-                self.call_ended = True
-            if self.deepgram_ws:
-                try:
-                    await self.deepgram_ws.close()
-                except Exception:
-                    pass
-                self.deepgram_ws = None
-            try:
-                await self.twilio_ws.close()
-            except Exception:
-                pass
+# LLM completion (OpenRouter primary → Groq fallback) lives in the shared llm_client
+# module, so the pipeline and the post-call scorer share ONE provider/fallback policy.
+from server.llm_client import complete as _llm_complete
 
 
 class ExotelVoiceConnectionManager:
     """
     Handles bidirectional audio streaming between Exotel and the AI pipeline.
-    Exotel streams 16-bit Linear PCM (not mu-law like Twilio), so we can
-    skip the pcm_to_mulaw conversion and stream raw PCM directly.
+    Exotel streams 16-bit Linear PCM, so we stream raw PCM straight through
+    (no mu-law conversion needed).
 
     Features:
     - [CALL_END] tag detection: LLM appends this when conversation should end
@@ -648,9 +160,24 @@ class ExotelVoiceConnectionManager:
         Dynamically determine and load the correct system prompt, agent name, and voice
         based on the target client's phone number or category.
         """
-        phone = start_data.get("to") or start_data.get("from") or ""
-        custom_params = start_data.get("customParameters", {}) or start_data.get("custom_parameters", {})
-        
+        # On Exotel OUTBOUND calls the customer is the `from` leg — `to` is our own
+        # ExoPhone/DID. Prioritise `from` so lead lookup + CRM logging use the real
+        # number.
+        phone = start_data.get("from") or start_data.get("to") or ""
+        custom_params = start_data.get("customParameters", {}) or start_data.get("custom_parameters", {}) or {}
+
+        # Exotel delivers a CustomField JSON blob as a single HTML-escaped key, e.g.
+        #   {'{&quot;bot_type&quot;: &quot;insurance&quot;, &quot;customer_name&quot;: &quot;X&quot;}': ''}
+        # Unwrap it back into a real dict so bot_type/name/category are honoured.
+        if isinstance(custom_params, dict) and len(custom_params) == 1:
+            only_key = next(iter(custom_params))
+            if isinstance(only_key, str) and only_key.strip().startswith("{"):
+                import html
+                try:
+                    custom_params = json.loads(html.unescape(only_key))
+                except Exception:
+                    pass
+
         bot_type = custom_params.get("bot_type") or "investment"
         customer_name = custom_params.get("customer_name") or ""
         customer_category = custom_params.get("customer_category") or custom_params.get("category") or ""
@@ -889,13 +416,10 @@ class ExotelVoiceConnectionManager:
                     polly_params["Text"] = text
                     polly_params["TextType"] = "ssml"
                 else:
-                    # Wrap plain text in SSML with gentle pauses at punctuation
-                    # This makes ALL LLM output sound more natural without changing prompts
-                    ssml_text = text
-                    # Add a micro-pause after "..." (the LLM's natural pause marker)
-                    ssml_text = ssml_text.replace("...", '<break time="350ms"/>')
-                    # Add a micro-pause after "।" (Devanagari full stop)
-                    ssml_text = ssml_text.replace("।", '।<break time="250ms"/>')
+                    # Let Polly's neural voice handle sentence pauses itself. Injecting a
+                    # <break> after every "।" plus ellipsis breaks made speech choppy —
+                    # callers hear that as "voice breaking". Strip ellipses; no extra breaks.
+                    ssml_text = text.replace("...", " ").replace("…", " ")
                     polly_params["Text"] = f"<speak>{ssml_text}</speak>"
                     polly_params["TextType"] = "ssml"
 
@@ -910,22 +434,44 @@ class ExotelVoiceConnectionManager:
                 duration_seconds = len(pcm_data) / 16000.0
                 
                 pcm_chunks = chunk_pcm(pcm_data, chunk_size=1600)
+                # NOTE: no logging inside this loop — per-chunk log I/O (~10/sec) stalls
+                # the send loop and causes choppy/breaking audio. Summary log after instead.
+                interrupted = False
                 for pcm_b64 in pcm_chunks:
-                    if self.call_ended or self.welcome_interrupted:
+                    if self.call_ended:
                         break
+                    if self.welcome_interrupted:
+                        interrupted = True
+                        break
+                    # Exotel AgentStream requires snake_case "stream_sid" (NOT camelCase
+                    # "streamSid"). With the wrong key Exotel silently drops the frame
+                    # and the caller hears dead air.
                     payload = {
                         "event": "media",
-                        "streamSid": self.stream_sid,
+                        "stream_sid": self.stream_sid,
                         "media": {
                             "payload": pcm_b64
                         }
                     }
-                    logger.info(f"[Exotel] Sending outbound chunk {self.outbound_chunk_index} | timestamp: {self.outbound_timestamp_ms} ms")
                     await self.exotel_ws.send_json(payload)
                     self.outbound_chunk_index += 1
                     self.outbound_timestamp_ms += 100  # 100ms per 1600-byte chunk at 8kHz 16-bit PCM
                     # Pace the streaming to real-time (slightly less than 100ms to prevent underrun)
                     await asyncio.sleep(0.09)
+
+                # Barge-in: the caller started speaking while Riya was talking. Stopping our
+                # send loop isn't enough — Exotel still has ~1s of audio buffered and will keep
+                # playing it (Riya talks over the caller). Send a `clear` event to flush that
+                # buffer so she stops instantly, like a real person would.
+                if interrupted:
+                    try:
+                        await self.exotel_ws.send_json(
+                            {"event": "clear", "stream_sid": self.stream_sid}
+                        )
+                        logger.info("[Exotel] Barge-in — sent clear to flush playout buffer.")
+                    except Exception as e:
+                        logger.debug(f"[Exotel] clear on barge-in failed: {e}")
+                logger.debug(f"[Exotel] Streamed {len(pcm_chunks)} chunks (~{duration_seconds:.1f}s audio)")
         except Exception as e:
             logger.error(f"[Exotel] _speak_text error: {e}")
         return duration_seconds
@@ -942,35 +488,26 @@ class ExotelVoiceConnectionManager:
             )
 
         def generate_welcome_message(b_type: str, c_name: str, crm_context: dict = None) -> str:
-            ctx = crm_context or {}
-            profession    = ctx.get("profession", "")
-            business_name = ctx.get("business_name", "")
-            city          = ctx.get("city", "Pune")
-            gender        = ctx.get("gender", "M")
+            # CRISP opener: greet + who + why + ask for a moment — all in one, no waiting
+            # for a "Namaste" back-and-forth. Plain words, ~20 words max.
+            _BUSINESS_SIGNALS = {
+                "pvt", "ltd", "llp", "clinic", "hospital", "pharmacy", "medical", "dental",
+                "lab", "dr", "doctor", "centre", "center", "enterprises", "traders", "agency",
+                "store", "shop", "school", "college", "institute", "trust", "associates", "studio", "care",
+            }
+            tokens = (c_name or "").lower().replace(".", " ").split()
+            is_business = bool(set(tokens) & _BUSINESS_SIGNALS)
+            name_part = f"{c_name} जी, " if (c_name and not is_business) else ""
 
-            # ── Salutation (works for all three) ──────────────────────────────────
-            if business_name:
-                greeting_line = f'Namaste, <break time="150ms"/> क्या यह {business_name} है?'
-            else:
-                _BUSINESS_SIGNALS = {
-                    "pvt", "ltd", "llp", "inc", "corp", "limited",
-                    "clinic", "hospital", "pharmacy", "medical", "dental", "lab",
-                    "dr", "dr.", "doctor", "centre", "center",
-                    "enterprise", "enterprises", "traders", "trading", "agency",
-                    "store", "shop", "mart", "school", "college", "institute", "foundation", "trust",
-                    "associates", "works", "care", "studio"
-                }
-                name_lower = c_name.lower() if c_name else ""
-                tokens = name_lower.replace(".", " ").split()
-                is_business = bool(set(tokens) & _BUSINESS_SIGNALS)
-                if is_business:
-                    greeting_line = f'Namaste, <break time="150ms"/> क्या यह {c_name} है?'
-                else:
-                    greeting_line = f'Namaste {c_name} ji? <break time="150ms"/>' if c_name else f'Namaste? <break time="150ms"/>'
+            if b_type == "insurance":
+                who, why = "मैं Aarav, Kalpvruksh Finserv Pune से", "आपके health cover पर एक ज़रूरी बात बतानी थी"
+            elif b_type == "recruitment":
+                who, why = "मैं Riya, Kalpvruksh Finserv Pune से", "एक extra income का आसान मौका बताना था"
+            else:  # investment
+                who, why = "मैं Riya, Kalpvruksh Finserv Pune से", "आपके पैसे बढ़ाने का एक आसान तरीका बताना था"
 
-            # Name Verification Check: Just return the greeting, don't include the hook.
-            # We add a slight interrogative pause so they respond.
-            return f'<speak>{greeting_line}</speak>'
+            opener = f"नमस्ते {name_part}{who}। {why} — दो मिनट हैं आपके पास?"
+            return f"<speak>{opener}</speak>"
 
         welcome_text = generate_welcome_message(bot_type, customer_name, getattr(self, "crm_context", {}))
                 
@@ -1031,38 +568,16 @@ class ExotelVoiceConnectionManager:
 
             if self.state_machine.state == CallState.HANGUP and instruction.startswith("The call has gone on too long"):
                 bot_text = "माफ़ कीजिएगा, यह call काफी लंबी हो गई है। मैं आपको बाद में कॉल करूँगी। [CALL_END]"
-                self.state_machine.chat_history.append({"role": "assistant", "content": bot_text})
-                self.state_machine.full_transcript.append({"role": "assistant", "content": bot_text})
                 logger.info(f"[Exotel] Bot (Max Turns): {bot_text}")
                 call_is_ending = True
             else:
                 messages = list(self.state_machine.chat_history)
                 messages.append({"role": "system", "content": instruction})
 
-                # 2. Get LLM Response from Groq (with 1 retry on transient errors)
-                bot_text = None
-                for attempt in range(2):
-                    try:
-                        response = await groq_client.chat.completions.create(
-                            model=config.LLM_MODEL or "llama-3.3-70b-versatile",
-                            messages=messages,
-                            temperature=0.3,
-                            max_tokens=150
-                        )
-                        bot_text = response.choices[0].message.content.strip()
-                        break  # Success
-                    except Exception as llm_err:
-                        if attempt == 0:
-                            logger.warning(f"[Exotel] LLM attempt 1 failed: {llm_err}. Retrying in 1s...")
-                            await asyncio.sleep(1.0)
-                        else:
-                            raise  # Let outer except handle it
-
-                self.state_machine.chat_history.append({
-                    "role": "assistant",
-                    "content": bot_text
-                })
-                self.state_machine.full_transcript.append({"role": "assistant", "content": bot_text})
+                # 2. Get LLM response — auto-falls back to a higher-limit model on
+                #    rate-limit/error so a quota hit degrades quality, not drops the call.
+                response = await _llm_complete(messages, temperature=0.5, max_tokens=100)
+                bot_text = response.choices[0].message.content.strip()
                 logger.info(f"[Exotel] Bot: {bot_text}")
 
                 # Post-process: let state machine parse tags and transition
@@ -1071,21 +586,22 @@ class ExotelVoiceConnectionManager:
                 if "[CALL_END]" in bot_text or self.state_machine.state == CallState.HANGUP:
                     call_is_ending = True
                     self.state_machine.state = CallState.HANGUP
-            
-            speak_text = re.sub(r'\[(?:CALL[\s_]*END|END[\s_]*CALL)\]', '', bot_text, flags=re.IGNORECASE).strip()
-            speak_text = speak_text.replace("[HANG_UP]", "").strip()
-            speak_text = speak_text.replace("[RECOVERY]", "").strip()
-            speak_text = re.sub(r'\[APPOINTMENT:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
-            speak_text = re.sub(r'\[LEAD:.*?\]', '', speak_text, flags=re.IGNORECASE).strip()
+
+            # Clean tags + enforce brevity/anti-AI-filler BEFORE TTS.
+            speak_text = _clean_speak_text(bot_text)
+            # Record the turn: history gets the SHORT spoken line so the model mirrors
+            # this brevity next turn; the transcript keeps the raw text for scoring.
+            self.state_machine.chat_history.append({"role": "assistant", "content": speak_text or bot_text})
+            self.state_machine.full_transcript.append({"role": "assistant", "content": bot_text})
 
             duration_seconds = 0.0
             if speak_text:
                 # Convert Text to Speech using AWS Polly (PCM output)
                 duration_seconds = await self._speak_text(speak_text)
 
-            # Since _speak_text now streams chunks in real-time, it already takes duration_seconds to run.
-            # We add a small post-speech pause (e.g. 0.5s) for natural conversation flow.
-            await asyncio.sleep(0.5)
+            # _speak_text already streams in real-time (takes duration_seconds). A short
+            # post-speech pause keeps the flow natural without adding perceptible lag.
+            await asyncio.sleep(0.2)
 
             # 5. If [CALL_END] was detected or we moved to HANGUP, close sockets
             if call_is_ending:
@@ -1196,7 +712,12 @@ class ExotelVoiceConnectionManager:
                 logger.error(f"[Exotel] Failed to save transcript to disk: {e}")
 
             # Log to CRM + WhatsApp
-            if lead.category == LeadCategory.HOT:
+            if lead.category == LeadCategory.DNC:
+                # Caller asked not to be contacted — add to DND so we never call again
+                from server.campaign.trai_compliance import add_to_dnd
+                add_to_dnd(getattr(self, 'caller_phone', ''), reason="requested_no_contact")
+                logger.info(f"[Exotel] 🚫 DNC — added {getattr(self, 'caller_phone', '')} to DND list")
+            elif lead.category == LeadCategory.HOT:
                 sheets_manager.log_hot_lead(lead, scheduled_day=scheduled_day, scheduled_time=scheduled_time)
                 await whatsapp_notifier.notify_manager_hot_lead(lead, scheduled_day=scheduled_day, scheduled_time=scheduled_time)
                 logger.info(f"[Exotel] 🔴 HOT LEAD logged: {lead.name or 'Unknown'} (Score: {lead.score})")

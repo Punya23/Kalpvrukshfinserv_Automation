@@ -22,6 +22,9 @@ voices_output.json
 data/call_logs/
 data/local_sheets/
 data/campaigns/
+data/call_attempts.json
+data/qa_call_logs_master.csv
+data/dnd_list.csv
 
 # Scratch/temp fix scripts
 fix_*.py
