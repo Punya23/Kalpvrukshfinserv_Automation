@@ -8,12 +8,14 @@ import csv
 import json
 import asyncio
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from enum import Enum
 
 import requests
+from twilio.rest import Client as TwilioClient
 
 from server.config import config
 from server.campaign.trai_compliance import (
@@ -66,6 +68,9 @@ class CampaignRunner:
         self.results: list[dict] = []
         self.current_index: int = 0
         self.bot_type: str = "investment"
+        # Read from env so Railway can flip between providers without a redeploy.
+        # Set TELEPHONY_PROVIDER=exotel in Railway env vars once Exotel KYC is done.
+        self.telephony_provider: str = os.getenv("TELEPHONY_PROVIDER", "twilio")
         self.gap_seconds: int = 90  # Gap between calls
         self.max_calls: int = 50
         self.enforce_optimal_windows: bool = True
@@ -147,12 +152,16 @@ class CampaignRunner:
         gap_seconds: int = 90,
         max_calls: int = 50,
         enforce_optimal_windows: bool = True,
+        telephony_provider: Optional[str] = None,
     ) -> dict:
         """Start the campaign. Runs as a background asyncio task."""
         if self.status == CampaignStatus.RUNNING:
             return {"error": "Campaign already running", "status": self.get_status()}
 
         self.bot_type = bot_type
+        # Allow caller to override provider per-campaign (e.g. auto-campaign always uses env default)
+        if telephony_provider:
+            self.telephony_provider = telephony_provider
         self.gap_seconds = gap_seconds
         self.max_calls = max_calls
         self.enforce_optimal_windows = enforce_optimal_windows
@@ -281,14 +290,17 @@ class CampaignRunner:
             "name": name,
             "category": category,
             "bot_type": self.bot_type,
-            "telephony": "exotel",
+            "telephony": self.telephony_provider,
             "timestamp": datetime.now().isoformat(),
             "outcome": "unknown",
             "call_status": "unknown",
         }
 
         try:
-            call_result = await self._initiate_exotel_call(phone, name, category, call_result)
+            if self.telephony_provider == "twilio":
+                call_result = await self._initiate_twilio_call(phone, name, category, call_result)
+            else:
+                call_result = await self._initiate_exotel_call(phone, name, category, call_result)
 
             if call_result.get("outcome") == "api_error":
                 return call_result
@@ -301,13 +313,82 @@ class CampaignRunner:
             return call_result
 
         # --- Wait for call to complete ---
-        # Use Exotel call-status polling so unanswered/busy/failed calls return in
-        # seconds instead of stalling the whole 300s timeout.
-        call_result["outcome"] = await self._wait_for_exotel_completion(
-            call_result.get("call_sid"), call_logs_before
-        )
+        if self.telephony_provider == "twilio":
+            # Twilio: just wait for a new transcript log to appear (no status polling API)
+            call_result["outcome"] = await self._wait_for_transcript(
+                call_logs_before, timeout_seconds=300
+            )
+        else:
+            # Exotel: fast status polling (detects no-answer/busy in seconds)
+            call_result["outcome"] = await self._wait_for_exotel_completion(
+                call_result.get("call_sid"), call_logs_before
+            )
 
         return call_result
+
+    async def _initiate_twilio_call(self, phone: str, name: str, category: str, call_result: dict) -> dict:
+        """Trigger a call via Twilio REST API (used during testing before Exotel KYC)."""
+        if not getattr(config, "TWILIO_ACCOUNT_SID", None) or not getattr(config, "TWILIO_AUTH_TOKEN", None):
+            call_result["call_status"] = "failed"
+            call_result["outcome"] = "api_error"
+            call_result["error"] = "Twilio credentials missing in env"
+            logger.error("[Campaign/Twilio] TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set.")
+            return call_result
+
+        client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
+        host = os.getenv("TUNNEL_HOST", "")
+        if not host:
+            call_result["call_status"] = "failed"
+            call_result["outcome"] = "api_error"
+            call_result["error"] = "TUNNEL_HOST env var not set — set it to your Railway public URL"
+            logger.error("[Campaign/Twilio] TUNNEL_HOST not set.")
+            return call_result
+
+        webhook_url = f"https://{host}/twilio/incoming-call"
+
+        try:
+            call = client.calls.create(
+                url=webhook_url,
+                to=phone,
+                from_=getattr(config, "TWILIO_PHONE_NUMBER", ""),
+            )
+            call_result["call_status"] = "initiated"
+            call_result["call_sid"] = call.sid
+            logger.info(f"[Campaign/Twilio] Call initiated → {name} ({phone}) | SID: {call.sid}")
+        except Exception as e:
+            call_result["call_status"] = "failed"
+            call_result["outcome"] = "api_error"
+            call_result["error"] = str(e)
+            logger.error(f"[Campaign/Twilio] Call failed: {e}")
+
+        return call_result
+
+    async def _wait_for_transcript(self, logs_before: set, timeout_seconds: int = 300) -> str:
+        """
+        Wait for a new call log file to appear in data/call_logs/.
+        Used for Twilio where we don't have a status polling API in free tier.
+        """
+        call_logs_dir = Path("data/call_logs")
+        elapsed = 0
+        poll_interval = 5
+
+        while elapsed < timeout_seconds:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            new_logs = set(call_logs_dir.glob("*.json")) - logs_before
+            if new_logs:
+                newest = max(new_logs, key=lambda p: p.stat().st_mtime)
+                try:
+                    data = json.loads(newest.read_text(encoding="utf-8"))
+                    outcome = data.get("outcome", data.get("lead_category", "completed"))
+                    logger.info(f"[Campaign/Twilio] Transcript found. Outcome: {outcome}")
+                    return outcome
+                except Exception:
+                    return "completed"
+
+        logger.warning("[Campaign/Twilio] No transcript within timeout — marking no-answer.")
+        return "no-answer"
 
     async def _initiate_exotel_call(self, phone: str, name: str, category: str, call_result: dict) -> dict:
         """Trigger a call via Exotel REST API."""

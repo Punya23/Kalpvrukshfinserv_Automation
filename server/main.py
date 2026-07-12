@@ -64,7 +64,7 @@ async def lifespan(app: FastAPI):
     for w in warnings:
         logger.warning(f"⚠️  {w}")
 
-    # Start the renewal scheduler (checks daily at 9:00 AM IST)
+    # Renewal reminders — daily 9:00 AM IST
     scheduler.add_job(
         renewal_scheduler.check_and_send_reminders,
         "cron",
@@ -74,7 +74,7 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
-    # Start the nightly lead scraper (runs daily at 8:00 PM IST)
+    # Nightly lead scraper — daily 8:00 PM IST
     scheduler.add_job(
         run_nightly_scrape,
         "cron",
@@ -84,9 +84,22 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
 
+    # Morning auto-campaign — daily 10:00 AM IST (first TRAI optimal window)
+    # Only fires on weekdays (Mon-Fri). Uses TELEPHONY_PROVIDER env var.
+    scheduler.add_job(
+        auto_morning_campaign,
+        "cron",
+        hour=10,
+        minute=0,
+        day_of_week="mon-fri",
+        id="morning_auto_campaign",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info("📅 Renewal scheduler started (daily at 09:00 AM)")
     logger.info("🔍 Lead scraper scheduled (daily at 08:00 PM)")
+    logger.info("📞 Morning campaign scheduled (Mon-Fri at 10:00 AM)")
     logger.info(f"🤖 LLM Provider: {config.LLM_PROVIDER} ({config.LLM_MODEL})")
     logger.info(f"🌐 Server: http://{config.SERVER_HOST}:{config.SERVER_PORT}")
     logger.info("=" * 60)
@@ -142,6 +155,39 @@ async def run_nightly_scrape():
             continue
 
     logger.info(f"✅ Nightly scrape complete. {total_new} new leads added.")
+
+
+async def auto_morning_campaign():
+    """
+    Morning auto-campaign — fires at 10:00 AM IST, Mon-Fri.
+    Reads leads from the previous night's scrape and calls them all
+    using whichever telephony provider is set in TELEPHONY_PROVIDER env var.
+    """
+    import os
+    from server.campaign.campaign_runner import campaign_runner
+    from server.campaign.trai_compliance import is_good_calling_day
+
+    if not is_good_calling_day():
+        logger.info("[AutoCampaign] Weekend detected — skipping morning campaign.")
+        return
+
+    if campaign_runner.status.value == "running":
+        logger.info("[AutoCampaign] Campaign already running — skipping.")
+        return
+
+    telephony = os.getenv("TELEPHONY_PROVIDER", "twilio")
+    csv_path = "data/leads/unified_compliant_leads.csv"
+
+    logger.info(f"[AutoCampaign] Starting morning campaign — provider={telephony}")
+    result = await campaign_runner.start(
+        bot_type="investment",
+        csv_path=csv_path,
+        gap_seconds=90,
+        max_calls=50,
+        enforce_optimal_windows=True,
+        telephony_provider=telephony,
+    )
+    logger.info(f"[AutoCampaign] Campaign started: {result}")
 
 
 # -------------------------------------------------------
@@ -413,6 +459,7 @@ class StartCampaignRequest(BaseModel):
     gap_seconds: int = 90  # Seconds between calls
     max_calls: int = 50
     enforce_optimal_windows: bool = True  # Only call during 10-12 AM, 3-5 PM
+    telephony_provider: Optional[str] = None  # "twilio" or "exotel" — None = read from TELEPHONY_PROVIDER env
 
 
 @app.post("/api/start-campaign")
@@ -437,6 +484,7 @@ async def start_campaign(request: StartCampaignRequest):
         gap_seconds=request.gap_seconds,
         max_calls=request.max_calls,
         enforce_optimal_windows=request.enforce_optimal_windows,
+        telephony_provider=request.telephony_provider,
     )
     status_code = 200 if "error" not in result else 400
     return JSONResponse(result, status_code=status_code)
