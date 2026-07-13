@@ -122,47 +122,126 @@ async def lifespan(app: FastAPI):
 async def run_nightly_scrape():
     """
     Nightly lead scraper — runs at 8 PM IST.
-    Uses the lead_pipeline collectors to scrape fresh leads,
-    deduplicates against existing data, and saves to unified CSV.
+
+    Collector chain (tried in order per query):
+      1. Overpass API (overpass.kumi.systems) — structured OSM data, phone numbers included
+      2. DuckDuckGo Maps — headless HTTP, works from cloud IPs
+    Nominatim is NOT used: it blocks Railway/datacenter IPs with empty 403 responses.
     """
-    import asyncio
     from server.lead_pipeline.core.csv_manager import UnifiedCSVManager
     from server.lead_pipeline.core.compliance import ComplianceGate
 
     logger.info("🔍 Nightly lead scrape starting...")
 
-    queries = [
-        ("doctors in pune", "doctor"),
-        ("architects in pune", "architect"),
-        ("CA chartered accountant in pune", "CA"),
-        ("interior designers in pune", "interior_designer"),
-        ("dentists in pune", "dentist"),
+    # (query_for_ddg, overpass_amenity_tag, category_label)
+    targets = [
+        ("doctors in Pune",              "amenity~\"doctors|clinic\"",          "doctor"),
+        ("dentists in Pune",             "amenity=\"dentist\"",                  "dentist"),
+        ("chartered accountants Pune",   "office~\"tax_advisor|accountant\"",   "CA"),
+        ("architects in Pune",           "office=\"architect\"",                "architect"),
+        ("interior designers Pune",      "shop=\"interior_decoration\"",        "interior_designer"),
     ]
 
     csv_manager = UnifiedCSVManager()
     compliance = ComplianceGate()
     total_new = 0
 
-    for query, category in queries:
+    def _overpass_fetch(amenity_filter: str, limit: int = 20) -> list:
+        """Hit Overpass API for Pune businesses matching amenity_filter."""
+        import requests as _req
+        query = f"""
+        [out:json][timeout:30];
+        area["name"="Pune"]["place"~"city|town"]->.pune;
+        (
+          node[{amenity_filter}]["phone"](area.pune);
+          way[{amenity_filter}]["phone"](area.pune);
+        );
+        out {limit * 3} qt;
+        """
         try:
-            # Use the DDG/Nominatim collector (no browser needed, works on Railway)
-            from server.lead_pipeline.collectors.collector_nominatim import NominatimCollector
-            collector = NominatimCollector()
-            leads = collector.fetch_real_leads(query, limit=15)
-
-            compliant = [l for l in leads if compliance.is_lead_callable(l)]
-            if compliant:
-                csv_manager.save_leads(compliant)
-                total_new += len(compliant)
-                logger.info(f"🔍 [{category}] Scraped {len(compliant)} compliant leads")
-            else:
-                logger.info(f"🔍 [{category}] No new compliant leads")
-
+            # Use two mirror endpoints in case one is slow
+            for endpoint in [
+                "https://overpass-api.de/api/interpreter",
+                "https://overpass.kumi.systems/api/interpreter",
+            ]:
+                resp = _req.post(
+                    endpoint,
+                    data={"data": query},
+                    headers={"User-Agent": "KalpvrukshLeadGen/1.0 (kalpvrukshfinserv@gmail.com)"},
+                    timeout=35,
+                )
+                logger.info(f"[Scraper/Overpass] {endpoint} → HTTP {resp.status_code}")
+                if resp.status_code == 200 and resp.text.strip():
+                    return resp.json().get("elements", [])
         except Exception as e:
-            logger.error(f"🔍 [{category}] Scrape failed: {e}")
-            continue
+            logger.warning(f"[Scraper/Overpass] Failed: {e}")
+        return []
 
-    logger.info(f"✅ Nightly scrape complete. {total_new} new leads added.")
+    def _ddg_fetch(query: str, limit: int = 15) -> list:
+        """DuckDuckGo Maps search — returns list of raw result dicts."""
+        try:
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                results = list(ddgs.maps(query, max_results=limit))
+            logger.info(f"[Scraper/DDG] '{query}' → {len(results)} results")
+            return results
+        except Exception as e:
+            logger.warning(f"[Scraper/DDG] '{query}' failed: {e}")
+            return []
+
+    from server.lead_pipeline.core.schema import MasterLead
+
+    for ddg_query, overpass_filter, category in targets:
+        leads_this_category: list[MasterLead] = []
+
+        # ── Tier 1: Overpass ─────────────────────────────────────────────
+        elements = await asyncio.to_thread(_overpass_fetch, overpass_filter)
+        for el in elements:
+            tags = el.get("tags", {})
+            name = tags.get("name", "").strip()
+            phone = (
+                tags.get("phone") or tags.get("contact:phone") or tags.get("contact:mobile") or ""
+            ).split(";")[0].split(",")[0].strip()
+            if name and phone:
+                leads_this_category.append(
+                    MasterLead.create(
+                        name=name, phone=phone, profession=category,
+                        city="Pune", source="overpass_osm",
+                        source_url=f"https://www.openstreetmap.org/node/{el.get('id','')}",
+                        lead_method="public_api",
+                    )
+                )
+
+        logger.info(f"[Scraper] [{category}] Overpass → {len(leads_this_category)} raw leads")
+
+        # ── Tier 2: DuckDuckGo Maps (if Overpass returned nothing) ────────
+        if not leads_this_category:
+            ddg_results = await asyncio.to_thread(_ddg_fetch, ddg_query)
+            for r in ddg_results:
+                name = (r.get("title") or "").strip()
+                phone = (r.get("phone") or "").strip()
+                if name and phone:
+                    leads_this_category.append(
+                        MasterLead.create(
+                            name=name, phone=phone, profession=category,
+                            city=r.get("address", "Pune"),
+                            source="duckduckgo_maps",
+                            source_url=r.get("url", ""),
+                            lead_method="public_search",
+                        )
+                    )
+            logger.info(f"[Scraper] [{category}] DDG fallback → {len(leads_this_category)} raw leads")
+
+        # ── Compliance gate + save ─────────────────────────────────────────
+        compliant = [l for l in leads_this_category if compliance.is_lead_callable(l)]
+        if compliant:
+            csv_manager.save_leads(compliant)
+            total_new += len(compliant)
+            logger.info(f"✅ [{category}] Saved {len(compliant)} compliant leads")
+        else:
+            logger.info(f"⚠️  [{category}] 0 compliant leads after gate")
+
+    logger.info(f"✅ Nightly scrape complete — {total_new} new leads added to unified CSV.")
 
 
 async def auto_morning_campaign():
