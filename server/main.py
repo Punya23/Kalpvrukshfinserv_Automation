@@ -124,10 +124,11 @@ async def run_nightly_scrape():
     Nightly lead scraper — runs at 8 PM IST.
 
     Collector chain (tried in order per query):
-      1. Overpass API (overpass.kumi.systems) — structured OSM data, phone numbers included
+      1. Overpass API (overpass-api.de + kumi mirror) — structured OSM data, phone numbers included
       2. DuckDuckGo Maps — headless HTTP, works from cloud IPs
     Nominatim is NOT used: it blocks Railway/datacenter IPs with empty 403 responses.
     """
+    import asyncio
     from server.lead_pipeline.core.csv_manager import UnifiedCSVManager
     from server.lead_pipeline.core.compliance import ComplianceGate
 
