@@ -124,79 +124,91 @@ async def run_nightly_scrape():
     Nightly lead scraper — runs at 8 PM IST.
 
     Collector chain (tried in order per query):
-      1. Overpass API (overpass-api.de + kumi mirror) — structured OSM data, phone numbers included
-      2. DuckDuckGo Maps — headless HTTP, works from cloud IPs
-    Nominatim is NOT used: it blocks Railway/datacenter IPs with empty 403 responses.
+      1. Overpass API — bounding-box query for Pune (reliable from cloud IPs)
+      2. DDGS Maps — DuckDuckGo local business search (new package name: ddgs)
+    Nominatim is NOT used: blocks Railway/datacenter IPs.
     """
     import asyncio
+    import time as _time
     from server.lead_pipeline.core.csv_manager import UnifiedCSVManager
     from server.lead_pipeline.core.compliance import ComplianceGate
+    from server.lead_pipeline.core.schema import MasterLead
 
     logger.info("🔍 Nightly lead scrape starting...")
 
-    # (query_for_ddg, overpass_amenity_tag, category_label)
+    # Pune bounding box: south,west,north,east
+    PUNE_BBOX = "18.3677,73.7561,18.6247,74.0851"
+
+    # (ddg_query, overpass_amenity_filters_list, category_label)
     targets = [
-        ("doctors in Pune",              "amenity~\"doctors|clinic\"",          "doctor"),
-        ("dentists in Pune",             "amenity=\"dentist\"",                  "dentist"),
-        ("chartered accountants Pune",   "office~\"tax_advisor|accountant\"",   "CA"),
-        ("architects in Pune",           "office=\"architect\"",                "architect"),
-        ("interior designers Pune",      "shop=\"interior_decoration\"",        "interior_designer"),
+        ("doctors clinic Pune",          ["amenity=doctors", "amenity=clinic"],             "doctor"),
+        ("dentist Pune",                 ["amenity=dentist"],                               "dentist"),
+        ("chartered accountant Pune",    ["office=tax_advisor", "office=accountant"],       "CA"),
+        ("architect Pune",               ["office=architect"],                              "architect"),
+        ("interior designer Pune",       ["shop=interior_decoration", "office=designer"],   "interior_designer"),
     ]
 
     csv_manager = UnifiedCSVManager()
     compliance = ComplianceGate()
     total_new = 0
 
-    def _overpass_fetch(amenity_filter: str, limit: int = 20) -> list:
-        """Hit Overpass API for Pune businesses matching amenity_filter."""
-        import requests as _req
-        query = f"""
-        [out:json][timeout:30];
-        area["name"="Pune"]["place"~"city|town"]->.pune;
-        (
-          node[{amenity_filter}]["phone"](area.pune);
-          way[{amenity_filter}]["phone"](area.pune);
-        );
-        out {limit * 3} qt;
+    def _overpass_fetch(filters: list, limit: int = 20) -> list:
         """
-        try:
-            # Use two mirror endpoints in case one is slow
+        Bounding-box Overpass query for Pune — more reliable than named-area.
+        Tries each amenity/office filter separately and merges results.
+        """
+        import requests as _req
+        all_elements = []
+        for f in filters:
+            query = (
+                f"[out:json][timeout:30];\n"
+                f"(\n"
+                f"  node[{f}]['phone']({PUNE_BBOX});\n"
+                f"  way[{f}]['phone']({PUNE_BBOX});\n"
+                f");\n"
+                f"out {limit * 2} qt;\n"
+            )
             for endpoint in [
                 "https://overpass-api.de/api/interpreter",
                 "https://overpass.kumi.systems/api/interpreter",
             ]:
-                resp = _req.post(
-                    endpoint,
-                    data={"data": query},
-                    headers={"User-Agent": "KalpvrukshLeadGen/1.0 (kalpvrukshfinserv@gmail.com)"},
-                    timeout=35,
-                )
-                logger.info(f"[Scraper/Overpass] {endpoint} → HTTP {resp.status_code}")
-                if resp.status_code == 200 and resp.text.strip():
-                    return resp.json().get("elements", [])
-        except Exception as e:
-            logger.warning(f"[Scraper/Overpass] Failed: {e}")
-        return []
+                try:
+                    resp = _req.post(
+                        endpoint,
+                        data={"data": query},
+                        headers={"User-Agent": "KalpvrukshLeadGen/1.0 (kalpvrukshfinserv@gmail.com)"},
+                        timeout=30,
+                    )
+                    logger.info(f"[Scraper/Overpass] {f} @ {endpoint.split('/')[2]} → HTTP {resp.status_code}")
+                    if resp.status_code == 200 and resp.text.strip():
+                        elements = resp.json().get("elements", [])
+                        all_elements.extend(elements)
+                        break  # Got data — don't try mirror
+                    elif resp.status_code == 429:
+                        logger.warning("[Scraper/Overpass] Rate limited — sleeping 10s")
+                        _time.sleep(10)
+                except Exception as e:
+                    logger.warning(f"[Scraper/Overpass] {endpoint} failed: {e}")
+            _time.sleep(3)  # Be polite between Overpass queries
+        return all_elements
 
     def _ddg_fetch(query: str, limit: int = 15) -> list:
-        """DuckDuckGo Maps search — returns list of raw result dicts."""
+        """DuckDuckGo Maps (ddgs package) — headless, works from cloud IPs."""
         try:
-            from duckduckgo_search import DDGS
-            with DDGS() as ddgs:
-                results = list(ddgs.maps(query, max_results=limit))
+            from ddgs import DDGS
+            with DDGS() as d:
+                results = list(d.maps(query, max_results=limit))
             logger.info(f"[Scraper/DDG] '{query}' → {len(results)} results")
             return results
         except Exception as e:
             logger.warning(f"[Scraper/DDG] '{query}' failed: {e}")
             return []
 
-    from server.lead_pipeline.core.schema import MasterLead
-
-    for ddg_query, overpass_filter, category in targets:
+    for ddg_query, overpass_filters, category in targets:
         leads_this_category: list[MasterLead] = []
 
-        # ── Tier 1: Overpass ─────────────────────────────────────────────
-        elements = await asyncio.to_thread(_overpass_fetch, overpass_filter)
+        # ── Tier 1: Overpass bounding-box ────────────────────────────────
+        elements = await asyncio.to_thread(_overpass_fetch, overpass_filters)
         for el in elements:
             tags = el.get("tags", {})
             name = tags.get("name", "").strip()
@@ -208,30 +220,20 @@ async def run_nightly_scrape():
                     MasterLead.create(
                         name=name, phone=phone, profession=category,
                         city="Pune", source="overpass_osm",
-                        source_url=f"https://www.openstreetmap.org/node/{el.get('id','')}",
+                        source_url=f"https://www.openstreetmap.org/node/{el.get('id', '')}",
                         lead_method="public_api",
                     )
                 )
+        logger.info(f"[Scraper] [{category}] Overpass → {len(leads_this_category)} leads with phone")
 
-        logger.info(f"[Scraper] [{category}] Overpass → {len(leads_this_category)} raw leads")
+        # ── Tier 2: Practo Live if Overpass had no phone data ───────────────
+        if not leads_this_category and category in ("doctor", "dentist"):
+            from server.lead_pipeline.collectors.collector_practo_live import PractoLiveCollector
+            practo_collector = PractoLiveCollector()
+            practo_leads = await asyncio.to_thread(practo_collector.fetch_leads, category, 15)
+            leads_this_category.extend(practo_leads)
+            logger.info(f"[Scraper] [{category}] Practo → {len(practo_leads)} leads with phone")
 
-        # ── Tier 2: DuckDuckGo Maps (if Overpass returned nothing) ────────
-        if not leads_this_category:
-            ddg_results = await asyncio.to_thread(_ddg_fetch, ddg_query)
-            for r in ddg_results:
-                name = (r.get("title") or "").strip()
-                phone = (r.get("phone") or "").strip()
-                if name and phone:
-                    leads_this_category.append(
-                        MasterLead.create(
-                            name=name, phone=phone, profession=category,
-                            city=r.get("address", "Pune"),
-                            source="duckduckgo_maps",
-                            source_url=r.get("url", ""),
-                            lead_method="public_search",
-                        )
-                    )
-            logger.info(f"[Scraper] [{category}] DDG fallback → {len(leads_this_category)} raw leads")
 
         # ── Compliance gate + save ─────────────────────────────────────────
         compliant = [l for l in leads_this_category if compliance.is_lead_callable(l)]
@@ -240,7 +242,9 @@ async def run_nightly_scrape():
             total_new += len(compliant)
             logger.info(f"✅ [{category}] Saved {len(compliant)} compliant leads")
         else:
-            logger.info(f"⚠️  [{category}] 0 compliant leads after gate")
+            logger.info(f"⚠️  [{category}] 0 compliant leads (OSM has no phones for this tag in Pune)")
+
+        await asyncio.sleep(2)  # Pause between categories
 
     logger.info(f"✅ Nightly scrape complete — {total_new} new leads added to unified CSV.")
 
