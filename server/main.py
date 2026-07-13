@@ -156,6 +156,7 @@ async def run_nightly_scrape():
         """
         Bounding-box Overpass query for Pune — more reliable than named-area.
         Tries each amenity/office filter separately and merges results.
+        Handles HTTP 429 (Too Many Requests) gracefully.
         """
         import requests as _req
         all_elements = []
@@ -172,24 +173,37 @@ async def run_nightly_scrape():
                 "https://overpass-api.de/api/interpreter",
                 "https://overpass.kumi.systems/api/interpreter",
             ]:
-                try:
-                    resp = _req.post(
-                        endpoint,
-                        data={"data": query},
-                        headers={"User-Agent": "KalpvrukshLeadGen/1.0 (kalpvrukshfinserv@gmail.com)"},
-                        timeout=30,
-                    )
-                    logger.info(f"[Scraper/Overpass] {f} @ {endpoint.split('/')[2]} → HTTP {resp.status_code}")
-                    if resp.status_code == 200 and resp.text.strip():
-                        elements = resp.json().get("elements", [])
-                        all_elements.extend(elements)
-                        break  # Got data — don't try mirror
-                    elif resp.status_code == 429:
-                        logger.warning("[Scraper/Overpass] Rate limited — sleeping 10s")
-                        _time.sleep(10)
-                except Exception as e:
-                    logger.warning(f"[Scraper/Overpass] {endpoint} failed: {e}")
-            _time.sleep(3)  # Be polite between Overpass queries
+                retry_count = 0
+                max_retries = 2
+                while retry_count <= max_retries:
+                    try:
+                        resp = _req.post(
+                            endpoint,
+                            data={"data": query},
+                            headers={"User-Agent": "KalpvrukshLeadGen/1.0 (kalpvrukshfinserv@gmail.com)"},
+                            timeout=30,
+                        )
+                        logger.info(f"[Scraper/Overpass] {f} @ {endpoint.split('/')[2]} → HTTP {resp.status_code}")
+                        if resp.status_code == 200 and resp.text.strip():
+                            elements = resp.json().get("elements", [])
+                            all_elements.extend(elements)
+                            break  # Got data — don't try mirror
+                        elif resp.status_code == 429:
+                            retry_count += 1
+                            if retry_count <= max_retries:
+                                wait_time = 15 * retry_count
+                                logger.warning(f"[Scraper/Overpass] Rate limited (429) — sleeping {wait_time}s")
+                                _time.sleep(wait_time)
+                            else:
+                                break
+                        else:
+                            break # Other errors, break retry loop and try mirror
+                    except Exception as e:
+                        logger.warning(f"[Scraper/Overpass] {endpoint} failed: {e}")
+                        break # Request exception, try mirror
+                if retry_count <= max_retries and resp.status_code == 200:
+                    break # Success, break endpoint loop
+            _time.sleep(5)  # Be polite between Overpass queries
         return all_elements
 
     def _ddg_fetch(query: str, limit: int = 15) -> list:
