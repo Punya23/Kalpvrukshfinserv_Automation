@@ -12,18 +12,24 @@ from server.config import config
 logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------
-# LLM Client Setup (supports both Groq free and OpenAI paid)
+# LLM Client Setup — OpenRouter primary, Groq fallback
+# (The voice pipeline uses the shared async llm_client.py;
+#  this sync client is only for the /chat text endpoint.)
 # -------------------------------------------------------
 
-if config.LLM_PROVIDER == "groq":
-    from groq import Groq
-    _llm_client = Groq(api_key=config.GROQ_API_KEY) if config.GROQ_API_KEY else None
-elif config.LLM_PROVIDER == "openai":
-    from openai import OpenAI
-    _llm_client = OpenAI(api_key=config.OPENAI_API_KEY) if config.OPENAI_API_KEY else None
+from openai import OpenAI as _OpenAI
+
+if config.OPENROUTER_API_KEY:
+    _llm_client = _OpenAI(
+        api_key=config.OPENROUTER_API_KEY,
+        base_url=config.OPENROUTER_BASE_URL,
+    )
+elif config.GROQ_API_KEY:
+    from groq import Groq as _Groq
+    _llm_client = _Groq(api_key=config.GROQ_API_KEY)
 else:
     _llm_client = None
-    logger.warning(f"Unknown LLM_PROVIDER: {config.LLM_PROVIDER}")
+    logger.warning("No LLM client configured — /chat will use keyword fallback")
 
 
 # Load orchestrator system prompt

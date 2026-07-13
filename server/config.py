@@ -16,14 +16,16 @@ class Config:
     """Central configuration for the AI automation system."""
 
     # --- LLM Provider ---
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "groq")  # "groq" (free) or "openai" (paid)
+    # OpenRouter is primary (pay-as-you-go, no daily quota).
+    # Groq is kept as a fast free fallback via llm_client.py's provider chain.
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openrouter")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
     # --- OpenRouter (primary LLM — pay-as-you-go, no daily quota; Groq kept as fallback) ---
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
-    OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+    OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
     OPENROUTER_BASE_URL: str = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
     # --- Phase 3 Voice Pipeline (Self-Hosted) ---
@@ -90,10 +92,12 @@ class Config:
     def validate(cls) -> list[str]:
         """Validate that required configuration is present. Returns list of warnings."""
         warnings = []
-        if cls.LLM_PROVIDER == "groq" and not cls.GROQ_API_KEY:
-            warnings.append("GROQ_API_KEY is not set — LLM calls will fail")
-        if cls.LLM_PROVIDER == "openai" and not cls.OPENAI_API_KEY:
-            warnings.append("OPENAI_API_KEY is not set — LLM calls will fail")
+        if not cls.OPENROUTER_API_KEY and not cls.GROQ_API_KEY:
+            warnings.append("Neither OPENROUTER_API_KEY nor GROQ_API_KEY is set — LLM calls will fail")
+        if not cls.DEEPGRAM_API_KEY:
+            warnings.append("DEEPGRAM_API_KEY not set — STT (speech-to-text) disabled")
+        if not cls.EXOTEL_API_KEY:
+            warnings.append("EXOTEL_API_KEY not set — outbound calls will fail")
         if not cls.LEADS_SHEET_ID:
             warnings.append("LEADS_SHEET_ID not set — Google Sheets logging disabled")
         if not cls.WHATSAPP_API_KEY:

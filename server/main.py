@@ -46,9 +46,11 @@ logging.getLogger("websockets.client").setLevel(logging.WARNING)
 
 
 # -------------------------------------------------------
-# Scheduler Setup (runs renewal checks daily at 9 AM)
+# Scheduler Setup (runs cron jobs in IST — Railway is UTC)
 # -------------------------------------------------------
-scheduler = AsyncIOScheduler()
+import pytz
+_IST = pytz.timezone("Asia/Kolkata")
+scheduler = AsyncIOScheduler(timezone=_IST)
 
 
 @asynccontextmanager
@@ -63,6 +65,12 @@ async def lifespan(app: FastAPI):
     warnings = config.validate()
     for w in warnings:
         logger.warning(f"⚠️  {w}")
+
+    # Ensure all data directories exist (Railway ephemeral FS)
+    import os as _os
+    for _d in ["data/leads", "data/call_logs", "data/campaigns", "data/qa"]:
+        _os.makedirs(_d, exist_ok=True)
+    logger.info("📁 Data directories ready")
 
     # Renewal reminders — daily 9:00 AM IST
     scheduler.add_job(
@@ -163,7 +171,6 @@ async def auto_morning_campaign():
     Reads leads from the previous night's scrape and calls them all
     using whichever telephony provider is set in TELEPHONY_PROVIDER env var.
     """
-    import os
     from server.campaign.campaign_runner import campaign_runner
     from server.campaign.trai_compliance import is_good_calling_day
 
@@ -175,17 +182,22 @@ async def auto_morning_campaign():
         logger.info("[AutoCampaign] Campaign already running — skipping.")
         return
 
-    telephony = os.getenv("TELEPHONY_PROVIDER", "twilio")
+    telephony = "exotel"
     csv_path = "data/leads/unified_compliant_leads.csv"
 
-    logger.info(f"[AutoCampaign] Starting morning campaign — provider={telephony}")
+    # Fallback: if unified CSV is empty/missing, use the static seed file
+    from pathlib import Path as _Path
+    if not _Path(csv_path).exists() or _Path(csv_path).stat().st_size < 100:
+        csv_path = "data/leads/hni_leads_pune.csv"
+        logger.info("[AutoCampaign] unified_compliant_leads.csv not ready — using seed file")
+
+    logger.info(f"[AutoCampaign] Starting morning campaign via Exotel — csv={csv_path}")
     result = await campaign_runner.start(
         bot_type="investment",
         csv_path=csv_path,
         gap_seconds=90,
         max_calls=50,
         enforce_optimal_windows=True,
-        telephony_provider=telephony,
     )
     logger.info(f"[AutoCampaign] Campaign started: {result}")
 
@@ -459,7 +471,6 @@ class StartCampaignRequest(BaseModel):
     gap_seconds: int = 90  # Seconds between calls
     max_calls: int = 50
     enforce_optimal_windows: bool = True  # Only call during 10-12 AM, 3-5 PM
-    telephony_provider: Optional[str] = None  # "twilio" or "exotel" — None = read from TELEPHONY_PROVIDER env
 
 
 @app.post("/api/start-campaign")
@@ -484,7 +495,6 @@ async def start_campaign(request: StartCampaignRequest):
         gap_seconds=request.gap_seconds,
         max_calls=request.max_calls,
         enforce_optimal_windows=request.enforce_optimal_windows,
-        telephony_provider=request.telephony_provider,
     )
     status_code = 200 if "error" not in result else 400
     return JSONResponse(result, status_code=status_code)

@@ -20,13 +20,13 @@ except FileNotFoundError:
     REMINDER_SYSTEM_PROMPT = "You are Vikram, a customer success manager at Kalpvruksh Finserv."
     logger.warning("Reminder bot prompt file not found, using fallback.")
 
-# LLM Client
-if config.LLM_PROVIDER == "groq":
-    from groq import Groq
-    _llm_client = Groq(api_key=config.GROQ_API_KEY) if config.GROQ_API_KEY else None
-elif config.LLM_PROVIDER == "openai":
-    from openai import OpenAI
-    _llm_client = OpenAI(api_key=config.OPENAI_API_KEY) if config.OPENAI_API_KEY else None
+# LLM Client — OpenRouter primary, Groq fallback
+from openai import OpenAI as _OpenAI
+if config.OPENROUTER_API_KEY:
+    _llm_client = _OpenAI(api_key=config.OPENROUTER_API_KEY, base_url=config.OPENROUTER_BASE_URL)
+elif config.GROQ_API_KEY:
+    from groq import Groq as _Groq
+    _llm_client = _Groq(api_key=config.GROQ_API_KEY)
 else:
     _llm_client = None
 
