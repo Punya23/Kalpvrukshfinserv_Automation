@@ -9,6 +9,15 @@ from datetime import datetime, time
 from pathlib import Path
 from typing import Optional
 import json
+import pytz
+
+_IST = pytz.timezone("Asia/Kolkata")
+
+
+def _now_ist() -> datetime:
+    """Return the current time in IST. Railway runs on UTC so datetime.now()
+    must never be used bare — always call this helper instead."""
+    return datetime.now(_IST)
 
 logger = logging.getLogger(__name__)
 
@@ -36,26 +45,26 @@ BLOCKED_DAYS = {5, 6}         # Sat, Sun
 
 def is_within_trai_hours(now: Optional[datetime] = None) -> bool:
     """Check if current time is within TRAI-permitted calling hours (9 AM – 9 PM IST)."""
-    now = now or datetime.now()
+    now = now or _now_ist()
     return TRAI_START <= now.time() <= TRAI_END
 
 
 def is_within_optimal_window(now: Optional[datetime] = None) -> bool:
     """Check if current time falls within an optimal calling window."""
-    now = now or datetime.now()
+    now = now or _now_ist()
     current_time = now.time()
     return any(start <= current_time <= end for start, end in OPTIMAL_WINDOWS)
 
 
 def is_good_calling_day(now: Optional[datetime] = None) -> bool:
     """Check if today is a good day for outbound campaigns."""
-    now = now or datetime.now()
+    now = now or _now_ist()
     return now.weekday() not in BLOCKED_DAYS
 
 
 def seconds_until_next_window(now: Optional[datetime] = None) -> int:
     """Calculate seconds until the next optimal calling window opens."""
-    now = now or datetime.now()
+    now = now or _now_ist()
     current_time = now.time()
 
     for start, end in OPTIMAL_WINDOWS:
@@ -74,7 +83,7 @@ def seconds_until_next_window(now: Optional[datetime] = None) -> int:
 
 def get_calling_status(now: Optional[datetime] = None) -> dict:
     """Return a human-readable status of current calling eligibility."""
-    now = now or datetime.now()
+    now = now or _now_ist()
     return {
         "current_time": now.strftime("%I:%M %p"),
         "current_day": now.strftime("%A"),
