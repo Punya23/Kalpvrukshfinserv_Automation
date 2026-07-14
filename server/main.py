@@ -266,11 +266,12 @@ async def run_nightly_scrape():
 async def auto_morning_campaign():
     """
     Morning auto-campaign — fires at 10:00 AM IST, Mon-Fri.
-    Reads leads from the previous night's scrape and calls them all
-    using whichever telephony provider is set in TELEPHONY_PROVIDER env var.
+    Resolves the best available leads CSV (dated scrape → unified → seed)
+    and starts calling all leads via Exotel.
     """
     from server.campaign.campaign_runner import campaign_runner
     from server.campaign.trai_compliance import is_good_calling_day
+    from server.lead_pipeline.core.csv_manager import get_best_campaign_csv
 
     if not is_good_calling_day():
         logger.info("[AutoCampaign] Weekend detected — skipping morning campaign.")
@@ -280,15 +281,7 @@ async def auto_morning_campaign():
         logger.info("[AutoCampaign] Campaign already running — skipping.")
         return
 
-    telephony = "exotel"
-    csv_path = "data/leads/unified_compliant_leads.csv"
-
-    # Fallback: if unified CSV is empty/missing, use the static seed file
-    from pathlib import Path as _Path
-    if not _Path(csv_path).exists() or _Path(csv_path).stat().st_size < 100:
-        csv_path = "data/leads/hni_leads_pune.csv"
-        logger.info("[AutoCampaign] unified_compliant_leads.csv not ready — using seed file")
-
+    csv_path = get_best_campaign_csv()
     logger.info(f"[AutoCampaign] Starting morning campaign via Exotel — csv={csv_path}")
     result = await campaign_runner.start(
         bot_type="investment",
@@ -298,6 +291,7 @@ async def auto_morning_campaign():
         enforce_optimal_windows=True,
     )
     logger.info(f"[AutoCampaign] Campaign started: {result}")
+
 
 
 # -------------------------------------------------------
