@@ -28,6 +28,7 @@ from server.campaign.trai_compliance import (
     filter_by_attempt_cap,
     record_attempt,
     get_calling_status,
+    add_to_dnd,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,6 +228,14 @@ class CampaignRunner:
                 if result.get("call_status") != "skipped":
                     total = record_attempt(lead.get("phone", ""), result.get("outcome", ""))
                     result["attempt_number"] = total
+                    # ── Persist to DND list so redeploys don't re-call anyone ──
+                    # Only mark as DND after a real conversation completed (not busy/no-answer)
+                    outcome = result.get("outcome", "")
+                    if outcome in ("completed", "answered"):
+                        add_to_dnd(
+                            lead.get("phone", ""),
+                            reason=f"called_{outcome}_{self.current_campaign_id}",
+                        )
 
                 logger.info(
                     f"📞 Call {i + 1}/{len(self.leads)}: "

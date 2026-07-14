@@ -515,6 +515,26 @@ async def trigger_renewal_check():
     return {"status": "Renewal check completed"}
 
 
+@app.get("/api/export-dnd")
+async def export_dnd():
+    """
+    Export all numbers that have already been called / added to DND.
+    Use this after a campaign to grab the called list, then commit
+    data/dnd_list.csv to git so it survives Railway redeploys.
+    """
+    from server.campaign.trai_compliance import get_dnd_set, get_already_called_phones, normalize_phone
+    dnd_nums = get_dnd_set()
+    called_nums = get_already_called_phones()
+    all_protected = sorted(dnd_nums | called_nums)
+    return {
+        "total": len(all_protected),
+        "dnd_count": len(dnd_nums),
+        "called_this_session_count": len(called_nums),
+        "numbers": [f"+91{n}" for n in all_protected],
+        "tip": "Commit data/dnd_list.csv to git to persist these across Railway redeploys.",
+    }
+
+
 @app.post("/api/trigger-scrape")
 async def trigger_scrape():
     """Manually trigger the lead scraper (for testing)."""
