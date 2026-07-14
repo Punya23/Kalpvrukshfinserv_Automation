@@ -1,0 +1,15 @@
+phone,reason,date_added
+# Do-Not-Disturb / Do-Not-Call list. One number per row.
+# Any lead whose number matches (normalized to 10 digits) is NEVER dialed.
+# Numbers are auto-added here when a call is scored as DNC (caller asked not to be contacted).
+# You can also paste TRAI DND numbers or manual opt-outs here. The 'phone' column
+# accepts any format (+9198..., 098..., 98...) — it is normalized on load.
+
+# --- Manually added: July 14 campaign (session wiped by redeploy) ---
++918208494378,called_completed_campaign_20260714,2026-07-14
++918037091588,called_completed_campaign_20260714,2026-07-14
++919422031544,called_completed_campaign_20260714,2026-07-14
++918484843993,called_completed_campaign_20260714,2026-07-14
+# busy/no-answer (not called back yet — remove these 2 lines if you want to retry them)
++918999017100,busy_campaign_20260714,2026-07-14
++917588358076,no_answer_campaign_20260714,2026-07-14
