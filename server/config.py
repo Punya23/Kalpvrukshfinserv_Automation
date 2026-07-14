@@ -17,7 +17,7 @@ class Config:
 
     # --- LLM Provider ---
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "cerebras")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.3-70b")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-oss-120b")
 
     # --- Cerebras (primary — fastest free inference, 30k tokens/min) ---
     # Free models: gpt-oss-120b (best quality), gemma-4-31b (fast fallback)
