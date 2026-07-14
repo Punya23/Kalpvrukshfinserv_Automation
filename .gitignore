@@ -24,7 +24,7 @@ data/local_sheets/
 data/campaigns/
 data/call_attempts.json
 data/qa_call_logs_master.csv
-data/dnd_list.csv
+# data/dnd_list.csv  ← tracked in git (force-added) — DO NOT re-add to gitignore
 
 # Scratch/temp fix scripts
 fix_*.py
