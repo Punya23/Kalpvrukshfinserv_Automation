@@ -16,17 +16,24 @@ class Config:
     """Central configuration for the AI automation system."""
 
     # --- LLM Provider ---
-    # OpenRouter is primary (pay-as-you-go, no daily quota).
-    # Groq is kept as a fast free fallback via llm_client.py's provider chain.
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openrouter")
-    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "cerebras")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.3-70b")
 
-    # --- OpenRouter (primary LLM — pay-as-you-go, no daily quota; Groq kept as fallback) ---
+    # --- Cerebras (primary — fastest free inference, 30k tokens/min) ---
+    # Free models: gpt-oss-120b (best quality), gemma-4-31b (fast fallback)
+    CEREBRAS_API_KEY: str = os.getenv("CEREBRAS_API_KEY", "")
+    CEREBRAS_MODEL: str = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+    CEREBRAS_MODEL_FALLBACK: str = os.getenv("CEREBRAS_MODEL_FALLBACK", "gemma-4-31b")
+    CEREBRAS_BASE_URL: str = "https://api.cerebras.ai/v1"
+
+    # --- OpenRouter (fallback — no daily quota, routes to fastest provider) ---
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
     OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
     OPENROUTER_BASE_URL: str = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
+    # --- Groq (last resort fallback) ---
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
     # --- Phase 3 Voice Pipeline (Self-Hosted) ---
     AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID", "")
@@ -92,8 +99,8 @@ class Config:
     def validate(cls) -> list[str]:
         """Validate that required configuration is present. Returns list of warnings."""
         warnings = []
-        if not cls.OPENROUTER_API_KEY and not cls.GROQ_API_KEY:
-            warnings.append("Neither OPENROUTER_API_KEY nor GROQ_API_KEY is set — LLM calls will fail")
+        if not cls.CEREBRAS_API_KEY and not cls.OPENROUTER_API_KEY and not cls.GROQ_API_KEY:
+            warnings.append("No LLM API key set (CEREBRAS_API_KEY / OPENROUTER_API_KEY / GROQ_API_KEY) — LLM calls will fail")
         if not cls.DEEPGRAM_API_KEY:
             warnings.append("DEEPGRAM_API_KEY not set — STT (speech-to-text) disabled")
         if not cls.EXOTEL_API_KEY:
