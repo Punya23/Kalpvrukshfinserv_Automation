@@ -59,6 +59,29 @@ _AI_ISH_PATTERNS = [
     (re.compile(r"\bat your convenience\b", re.I), "jab aapko time ho"),
 ]
 
+_VOICEMAIL_MARKERS = re.compile(
+    r"voicemail|leave a message|not available|trying to reach|at the tone|"
+    r"press \d|mailbox|record your message|after the beep|person you are (?:calling|trying)|"
+    r"cannot take your call|please leave|your call has been forwarded|"
+    r"the person you are trying to reach",
+    re.I,
+)
+
+_BUSINESS_NAME_SIGNALS = {
+    "pvt", "ltd", "llp", "clinic", "hospital", "pharmacy", "medical", "dental",
+    "lab", "dr", "doctor", "centre", "center", "enterprises", "traders", "agency",
+    "store", "shop", "school", "college", "institute", "trust", "associates", "studio", "care",
+}
+
+
+def _is_voicemail(text: str) -> bool:
+    return bool(_VOICEMAIL_MARKERS.search((text or "").lower()))
+
+
+def _is_business_name(name: str) -> bool:
+    tokens = (name or "").lower().replace(".", " ").split()
+    return bool(set(tokens) & _BUSINESS_NAME_SIGNALS)
+
 
 def _strip_ai_ish(text: str) -> str:
     """Remove canned assistant filler that makes the voice sound robotic."""
@@ -100,6 +123,35 @@ def _shorten_for_voice(text: str, max_words: int = 26) -> str:
     return result
 
 
+def _escape_ssml(text: str) -> str:
+    """Escape XML special characters for AWS Polly SSML."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _parse_exotel_custom_params(raw_params) -> dict:
+    """Normalize Exotel custom_parameters into a plain dict."""
+    if not isinstance(raw_params, dict):
+        return {}
+
+    custom_params = raw_params
+    if len(custom_params) == 1:
+        only_key = next(iter(custom_params))
+        if isinstance(only_key, str) and only_key.strip().startswith("{"):
+            import html
+            try:
+                decoded = html.unescape(only_key).replace("\\'", "'")
+                custom_params = json.loads(decoded)
+            except Exception:
+                pass
+
+    return custom_params if isinstance(custom_params, dict) else {}
+
+
 def _clean_speak_text(bot_text: str) -> str:
     """Strip control tags, remove AI-ish filler, and hard-cap length for TTS."""
     t = re.sub(r"\[(?:CALL[\s_]*END|END[\s_]*CALL)\]", "", bot_text, flags=re.IGNORECASE)
@@ -120,7 +172,7 @@ polly_client = boto3.client(
 
 # LLM completion (OpenRouter primary → Groq fallback) lives in the shared llm_client
 # module, so the pipeline and the post-call scorer share ONE provider/fallback policy.
-from server.llm_client import complete as _llm_complete
+from server.llm_client import complete as _llm_complete, message_content
 
 
 class ExotelVoiceConnectionManager:
@@ -144,10 +196,12 @@ class ExotelVoiceConnectionManager:
         self.call_ended = False  # Flag to prevent processing after hangup
         self.welcome_interrupted = False  # Barge-in flag for welcome message
         self.barge_in_transcript = ""
+        self._generation_id = 0  # Cancels stale LLM responses after barge-in
         self._deepgram_reconnect_count = 0
         self.silence_watchdog_task = None  # Tracks the silence timer
-        self.agent_voice = "Kajal"
-        self.agent_lang = "hi-IN"
+        self.agent_voice = config.POLLY_VOICE_ID
+        self.agent_lang = config.POLLY_LANG_CODE
+        self.agent_name = config.AGENT_NAME
         self.outbound_chunk_index = 1
         self.outbound_timestamp_ms = 0
         self.last_speak_finished_time = 0.0
@@ -164,19 +218,9 @@ class ExotelVoiceConnectionManager:
         # ExoPhone/DID. Prioritise `from` so lead lookup + CRM logging use the real
         # number.
         phone = start_data.get("from") or start_data.get("to") or ""
-        custom_params = start_data.get("customParameters", {}) or start_data.get("custom_parameters", {}) or {}
-
-        # Exotel delivers a CustomField JSON blob as a single HTML-escaped key, e.g.
-        #   {'{&quot;bot_type&quot;: &quot;insurance&quot;, &quot;customer_name&quot;: &quot;X&quot;}': ''}
-        # Unwrap it back into a real dict so bot_type/name/category are honoured.
-        if isinstance(custom_params, dict) and len(custom_params) == 1:
-            only_key = next(iter(custom_params))
-            if isinstance(only_key, str) and only_key.strip().startswith("{"):
-                import html
-                try:
-                    custom_params = json.loads(html.unescape(only_key))
-                except Exception:
-                    pass
+        custom_params = _parse_exotel_custom_params(
+            start_data.get("customParameters", {}) or start_data.get("custom_parameters", {}) or {}
+        )
 
         bot_type = custom_params.get("bot_type") or "investment"
         customer_name = custom_params.get("customer_name") or ""
@@ -218,6 +262,8 @@ class ExotelVoiceConnectionManager:
         # --- CRM Context Extraction for Welcome Message ---
         CATEGORY_MAP = {
             "doctors in pune":               {"profession": "doctor",  "city": "Pune", "bot_type": "insurance"},
+            "dentist":                       {"profession": "dentist", "city": "Pune", "bot_type": "insurance"},
+            "dental":                        {"profession": "dentist", "city": "Pune", "bot_type": "insurance"},
             "architects in pune":            {"profession": "architect","city": "Pune", "bot_type": "recruitment"},
             "chartered accountants":         {"profession": "CA",      "city": "Pune", "bot_type": "recruitment"},
             "salaried professionals":        {"profession": "",        "city": "Pune", "bot_type": "investment"},
@@ -237,26 +283,35 @@ class ExotelVoiceConnectionManager:
             bot_type = await classify_bot_type(customer_category)
             logger.info(f"[Exotel] Classified lead category '{customer_category}' -> Bot Type: {bot_type}")
 
-        # Set agent voice and language
-        self.agent_voice = "Kajal"
-        self.agent_lang = "hi-IN"
+        # Set agent voice and language from config (Kajal / Riya by default)
+        self.agent_voice = config.POLLY_VOICE_ID
+        self.agent_lang = config.POLLY_LANG_CODE
+        self.agent_name = config.AGENT_NAME
             
         self.bot_type = bot_type
         self.customer_name = customer_name
         self.customer_category = customer_category
         self.caller_phone = clean_phone  # Store for CRM logging at hangup
-            
-        # Infer business name if the customer name sounds like a business (simple heuristic)
-        if any(w in customer_name.lower() for w in ["clinic", "hospital", "associates", "enterprises", "solutions"]):
+
+        # Personal vs business greeting — keep customer_name for CRM either way
+        if _is_business_name(customer_name):
             self.crm_context["business_name"] = customer_name
-            self.customer_name = ""  # Clear the name so we greet the business directly
+            self.greeting_name = ""
+        else:
+            self.greeting_name = customer_name
             
         self.state_machine = VoiceStateMachine(
             bot_type=bot_type, 
             customer_name=self.customer_name, 
-            customer_category=customer_category
+            customer_category=customer_category,
+            agent_name=self.agent_name,
         )
-        logger.info(f"[Exotel] Active Persona State Machine | Bot Type: {bot_type} | CRM Context: {self.crm_context} | Voice: {self.agent_voice} | Target Client: {self.customer_name} | Phone: {clean_phone} | Category: {customer_category}")
+        logger.info(
+            f"[Exotel] Active Persona State Machine | Bot Type: {bot_type} | "
+            f"CRM Context: {self.crm_context} | Voice: {self.agent_voice} | "
+            f"Agent: {self.agent_name} | Target Client: {self.customer_name} | "
+            f"Phone: {clean_phone} | Category: {customer_category}"
+        )
 
     async def connect_to_deepgram(self):
         """Establish WebSocket connection to Deepgram for live STT.
@@ -356,6 +411,13 @@ class ExotelVoiceConnectionManager:
 
                         if clean_transcript and (data.get("is_final") or data.get("speech_final")):
                             logger.info(f"[Exotel] User: {clean_transcript}")
+
+                            # Voicemail / IVR — hang up immediately, don't waste a campaign slot
+                            if _is_voicemail(clean_transcript):
+                                logger.info(f"[Exotel] Voicemail/IVR detected: '{clean_transcript}' — hanging up.")
+                                asyncio.create_task(self._hangup_voicemail())
+                                continue
+
                             # Reset silence watchdog — user is speaking
                             self._reset_silence_watchdog()
                             
@@ -367,9 +429,15 @@ class ExotelVoiceConnectionManager:
                                     logger.info(f"[Exotel] Ignoring barge-in '{clean_transcript}' because call is in final goodbye.")
                                     continue
                                 
-                                # Barge-in: if user speaks during welcome/bot, interrupt it
+                                # Barge-in: interrupt bot speech and queue this utterance
                                 self.welcome_interrupted = True
                                 self.barge_in_transcript = clean_transcript
+                                self._generation_id += 1  # Cancel any in-flight LLM response
+                                if getattr(self, 'state_machine', None):
+                                    if self.state_machine.state == CallState.OPENING:
+                                        self.state_machine.welcome_interrupted = True
+                                    else:
+                                        self.state_machine.bot_was_interrupted = True
                                 logger.info(f"[Exotel] User barged in with '{clean_transcript}' — interrupting bot.")
                                 continue
                                 
@@ -419,7 +487,7 @@ class ExotelVoiceConnectionManager:
                     # Let Polly's neural voice handle sentence pauses itself. Injecting a
                     # <break> after every "।" plus ellipsis breaks made speech choppy —
                     # callers hear that as "voice breaking". Strip ellipses; no extra breaks.
-                    ssml_text = text.replace("...", " ").replace("…", " ")
+                    ssml_text = _escape_ssml(text.replace("...", " ").replace("…", " "))
                     polly_params["Text"] = f"<speak>{ssml_text}</speak>"
                     polly_params["TextType"] = "ssml"
 
@@ -484,38 +552,35 @@ class ExotelVoiceConnectionManager:
             self.state_machine = VoiceStateMachine(
                 bot_type=bot_type, 
                 customer_name=customer_name, 
-                customer_category=getattr(self, 'customer_category', '')
+                customer_category=getattr(self, 'customer_category', ''),
+                agent_name=getattr(self, 'agent_name', config.AGENT_NAME),
             )
 
-        def generate_welcome_message(b_type: str, c_name: str, crm_context: dict = None) -> str:
-            # CRISP opener: greet + who + why + ask for a moment — all in one, no waiting
-            # for a "Namaste" back-and-forth. Plain words, ~20 words max.
-            _BUSINESS_SIGNALS = {
-                "pvt", "ltd", "llp", "clinic", "hospital", "pharmacy", "medical", "dental",
-                "lab", "dr", "doctor", "centre", "center", "enterprises", "traders", "agency",
-                "store", "shop", "school", "college", "institute", "trust", "associates", "studio", "care",
-            }
-            tokens = (c_name or "").lower().replace(".", " ").split()
-            is_business = bool(set(tokens) & _BUSINESS_SIGNALS)
-            name_part = f"{c_name} जी, " if (c_name and not is_business) else ""
+        def generate_welcome_message(b_type: str, c_name: str, agent: str) -> str:
+            # CRISP opener: greet + who + why + ask for a moment — all in one
+            is_business = _is_business_name(c_name)
+            name_part = f"{_escape_ssml(c_name)} जी, " if (c_name and not is_business) else ""
 
             if b_type == "insurance":
-                who, why = "मैं Aarav, Kalpvruksh Finserv Pune से", "आपके health cover पर एक ज़रूरी बात बतानी थी"
+                why = "आपके health cover पर एक ज़रूरी बात बतानी थी"
             elif b_type == "recruitment":
-                who, why = "मैं Riya, Kalpvruksh Finserv Pune से", "एक extra income का आसान मौका बताना था"
-            else:  # investment
-                who, why = "मैं Riya, Kalpvruksh Finserv Pune से", "आपके पैसे बढ़ाने का एक आसान तरीका बताना था"
+                why = "एक extra income का आसान मौका बताना था"
+            else:
+                why = "आपके पैसे बढ़ाने का एक आसान तरीका बताना था"
 
+            who = f"मैं {_escape_ssml(agent)}, Kalpvruksh Finserv Pune से"
             opener = f"नमस्ते {name_part}{who}। {why} — दो मिनट हैं आपके पास?"
             return f"<speak>{opener}</speak>"
 
-        welcome_text = generate_welcome_message(bot_type, customer_name, getattr(self, "crm_context", {}))
+        greeting_name = getattr(self, "greeting_name", customer_name)
+        agent = getattr(self, "agent_name", config.AGENT_NAME)
+        welcome_text = generate_welcome_message(bot_type, greeting_name, agent)
                 
         self.state_machine.state = CallState.OPENING
         # Clean SSML tags for chat history
-        clean_welcome = welcome_text
-        clean_welcome = re.sub(r'<[^>]+>', '', clean_welcome)
+        clean_welcome = re.sub(r'<[^>]+>', '', welcome_text)
         clean_welcome = re.sub(r'\s+', ' ', clean_welcome).strip()
+        self.state_machine.welcome_spoken = clean_welcome
         self.state_machine.chat_history.append({"role": "assistant", "content": clean_welcome})
         self.state_machine.full_transcript.append({"role": "assistant", "content": clean_welcome})
         logger.info(f"[Exotel] Welcoming customer directly: {welcome_text}")
@@ -533,6 +598,30 @@ class ExotelVoiceConnectionManager:
                 asyncio.create_task(self.process_llm_and_speak(transcript_to_process))
                 
             self.welcome_interrupted = False
+            # state_machine.welcome_interrupted cleared inside process_llm_and_speak
+
+    async def _fallback_bot_text(self, user_text: str) -> str:
+        """Deterministic fallback when LLM returns empty — keeps the call alive and human."""
+        from server.voice_state_machine import classify_utterance
+        sm = self.state_machine
+        agent = getattr(self, "agent_name", config.AGENT_NAME)
+        if sm.bot_type == "insurance":
+            why = "health cover पर एक बात थी"
+        elif sm.bot_type == "recruitment":
+            why = "एक business opportunity के बारे में था"
+        else:
+            why = "आपकी savings बढ़ाने के बारे में था"
+
+        utterance = classify_utterance(user_text)
+        if utterance == "greeting":
+            return f"हाँ जी! मैं {agent}, Kalpvruksh Finserv Pune से — {why}। दो मिनट हैं आपके पास?"
+        if utterance == "identity":
+            return f"जी, मैं {agent} बोल रही हूँ — Kalpvruksh Finserv, Pune से। {why.capitalize()}।"
+        if utterance == "busy":
+            return f"कोई बात नहीं, मैं बाद में call करूँगी या WhatsApp पर details भेज दूँगी।"
+        if utterance == "hard_refusal":
+            return "ठीक है, धन्यवाद। नमस्ते! [CALL_END]"
+        return f"जी, मैं {agent}, Kalpvruksh Finserv Pune से बोल रही हूँ। {why.capitalize()} — सुन सकती हैं आप?"
 
     async def process_llm_and_speak(self, user_text: str):
         """Pass user text to Groq, then to Polly, then stream PCM back to Exotel.
@@ -542,12 +631,14 @@ class ExotelVoiceConnectionManager:
             return
 
         self.is_bot_speaking = True
+        my_generation = self._generation_id
         
         if not hasattr(self, 'state_machine') or self.state_machine is None:
             self.state_machine = VoiceStateMachine(
                 bot_type=getattr(self, 'bot_type', 'investment'), 
                 customer_name=getattr(self, 'customer_name', ''), 
-                customer_category=getattr(self, 'customer_category', '')
+                customer_category=getattr(self, 'customer_category', ''),
+                agent_name=getattr(self, 'agent_name', config.AGENT_NAME),
             )
 
         try:
@@ -563,6 +654,10 @@ class ExotelVoiceConnectionManager:
                 )
 
             instruction = self.state_machine.get_instruction_for_current_state(user_text=user_text)
+            turn_context = self.state_machine.get_turn_context(user_text)
+            # Consume interruption flags now that context has been built
+            self.state_machine.welcome_interrupted = False
+            self.state_machine.bot_was_interrupted = False
             
             call_is_ending = False
 
@@ -572,12 +667,20 @@ class ExotelVoiceConnectionManager:
                 call_is_ending = True
             else:
                 messages = list(self.state_machine.chat_history)
+                if turn_context:
+                    messages.append({"role": "system", "content": turn_context})
                 messages.append({"role": "system", "content": instruction})
 
                 # 2. Get LLM response — auto-falls back to a higher-limit model on
                 #    rate-limit/error so a quota hit degrades quality, not drops the call.
                 response = await _llm_complete(messages, temperature=0.5, max_tokens=100)
-                bot_text = response.choices[0].message.content.strip()
+                if my_generation != self._generation_id:
+                    logger.info("[Exotel] Stale LLM response discarded (user barged in again).")
+                    return
+                bot_text = message_content(response)
+                if not bot_text:
+                    bot_text = await self._fallback_bot_text(user_text)
+                    logger.warning(f"[Exotel] LLM empty — using fallback: {bot_text}")
                 logger.info(f"[Exotel] Bot: {bot_text}")
 
                 # Post-process: let state machine parse tags and transition
@@ -632,6 +735,25 @@ class ExotelVoiceConnectionManager:
                 asyncio.create_task(self.process_llm_and_speak(transcript_to_process))
 
             self.welcome_interrupted = False
+
+    async def _hangup_voicemail(self):
+        """End call quickly when voicemail/IVR is detected."""
+        if self.call_ended:
+            return
+        self.call_ended = True
+        logger.info("[Exotel] Voicemail hangup — skipping lead scoring.")
+        if self.silence_watchdog_task and not self.silence_watchdog_task.done():
+            self.silence_watchdog_task.cancel()
+        if self.deepgram_ws:
+            try:
+                await self.deepgram_ws.close()
+            except Exception:
+                pass
+            self.deepgram_ws = None
+        try:
+            await self.exotel_ws.close()
+        except Exception:
+            pass
 
     async def _score_and_log_lead(self):
         """LLM-based lead scoring + CRM logging (Exotel)."""

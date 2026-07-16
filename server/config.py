@@ -40,6 +40,9 @@ class Config:
     AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
     AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
     DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
+    POLLY_VOICE_ID: str = os.getenv("POLLY_VOICE_ID", "Kajal")
+    POLLY_LANG_CODE: str = os.getenv("POLLY_LANG_CODE", "hi-IN")
+    AGENT_NAME: str = os.getenv("AGENT_NAME", "Riya")
 
     # --- Exotel (India Telephony) ---
     EXOTEL_API_KEY: str = os.getenv("EXOTEL_API_KEY", "")

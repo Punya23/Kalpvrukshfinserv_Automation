@@ -125,6 +125,7 @@ async def complete(messages, temperature: float = 0.5, max_tokens: int = 150):
         )
 
     last_err = None
+    last_empty_resp = None  # kept as a last-resort return if every provider comes back empty
     for i, (label, model, client, extra) in enumerate(chain):
         try:
             resp = await client.chat.completions.create(
@@ -134,6 +135,26 @@ async def complete(messages, temperature: float = 0.5, max_tokens: int = 150):
                 max_tokens=max_tokens,
                 **extra,
             )
+
+            # Reasoning models (e.g. Cerebras gpt-oss-120b) can burn the ENTIRE token
+            # budget on their hidden reasoning trace before writing any `content` —
+            # especially with a long system prompt. That's a successful API call with
+            # a useless empty reply, which the except-block below would never catch.
+            # Treat it as a soft failure and fall through to the next (non-reasoning)
+            # provider, unless this is the last one — then return it as-is and let the
+            # caller's message_content()/fallback-text path handle the empty content.
+            content = (resp.choices[0].message.content or "").strip()
+            is_last = i == len(chain) - 1
+            if not content and not is_last:
+                last_empty_resp = resp
+                logger.warning(
+                    f"[LLM] {label}:{model} returned empty content "
+                    f"(finish_reason={resp.choices[0].finish_reason}, likely reasoning-token exhaustion) "
+                    "— trying next provider"
+                )
+                await asyncio.sleep(0.1)
+                continue
+
             if i > 0:
                 logger.warning(f"[LLM] served by fallback {label}:{model}")
             else:
@@ -162,4 +183,19 @@ async def complete(messages, temperature: float = 0.5, max_tokens: int = 150):
 
             await asyncio.sleep(0.2)
 
-    raise last_err
+    # Every provider either errored or came back empty. Prefer a real exception if we
+    # have one; otherwise every provider "succeeded" with empty content (reasoning-token
+    # exhaustion) — return the last such response so the caller's message_content()/
+    # fallback-text path can degrade gracefully instead of us raising None.
+    if last_err is not None:
+        raise last_err
+    return last_empty_resp
+
+
+def message_content(response, default: str = "") -> str:
+    """Safely extract assistant text from a chat completion (content may be None)."""
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError):
+        return default
+    return (content or default).strip()

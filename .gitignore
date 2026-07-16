@@ -38,3 +38,6 @@ client_secret.json
 implementation_plan.md
 mds/
 n8n/
+
+# Railway log exports (may contain call transcripts/PII — local debugging only)
+logs.*.json

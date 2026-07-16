@@ -18,9 +18,71 @@ from server.config import config
 
 # Post-call scoring/classification share the same OpenRouter→Groq fallback policy
 # as the live conversation, via the shared llm_client module.
-from server.llm_client import complete as _complete_with_fallback
+from server.llm_client import complete as _complete_with_fallback, message_content
 
 logger = logging.getLogger(__name__)
+
+# ── Utterance classifiers (deterministic — no LLM needed) ──────────
+
+_GREETING_ONLY = re.compile(
+    r"^(hello|hi|hey|hii|namaste|namaskar|haan|ha|hmm|hm|bolo|boliye|bolo na|"
+    r"yes|yeah|yep|speak|sun|suniye|sun rahe|sun rahi|ok|okay|theek|thik|"
+    r"हाँ|हां|जी|बोलिए|बोलो|नमस्ते|सुन|ठीक)\b",
+    re.I,
+)
+_IDENTITY_QUESTION = re.compile(
+    r"(kaun\b|who is|who are|kahan se|kis liye|kyun call|why.*call|aap kaun|"
+    r"kon bol|konsa number|kis company|which company|kya kaam)",
+    re.I,
+)
+_BUSY_REFUSAL = re.compile(
+    r"(busy|meeting|abhi nahi|baad mein|baad me|call later|time nahi|not now|"
+    r"can't talk|cannot talk|driving|driving me)",
+    re.I,
+)
+_HARD_REFUSAL = re.compile(
+    r"(nahi chahiye|not interested|remove number|call mat|don't call|mat karo|"
+    r"no thanks|band karo|scam|fraud)",
+    re.I,
+)
+
+
+def classify_utterance(text: str) -> str:
+    """Classify a user utterance for smarter state navigation."""
+    t = (text or "").strip()
+    if not t:
+        return "empty"
+    tl = t.lower()
+    if _HARD_REFUSAL.search(tl):
+        return "hard_refusal"
+    if _IDENTITY_QUESTION.search(tl):
+        return "identity"
+    if _BUSY_REFUSAL.search(tl):
+        return "busy"
+    words = tl.split()
+    if _GREETING_ONLY.match(tl) or (len(words) <= 3 and any(
+        w in tl for w in (
+            "hello", "hi", "haan", "हाँ", "हां", "ji", "जी", "namaste", "नमस्ते",
+            "boliye", "बोलिए", "bolo", "बोलो", "sun", "सुन",
+        )
+    )):
+        return "greeting"
+    return "substantive"
+
+
+def _extract_json_object(raw: str) -> dict | None:
+    """Best-effort JSON extraction when the LLM returns malformed JSON."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    return None
 
 
 # ── State Definitions ──────────────────────────────────────────────
@@ -117,7 +179,10 @@ async def classify_bot_type(category: str) -> str:
         res = await _complete_with_fallback(
             [{"role": "user", "content": prompt}], temperature=0.0, max_tokens=10
         )
-        result = re.sub(r"[^A-Z]", "", res.choices[0].message.content.strip().upper())
+        raw = message_content(res)
+        if not raw:
+            return "investment"
+        result = re.sub(r"[^A-Z]", "", raw.upper())
         return {"INVESTMENT": "investment", "INSURANCE": "insurance", "RECRUITMENT": "recruitment"}.get(result, "investment")
     except Exception as e:
         logger.error(f"classify_bot_type error: {e}")
@@ -163,8 +228,12 @@ Output JSON:
         res = await _complete_with_fallback(
             [{"role": "user", "content": prompt}], temperature=0.0, max_tokens=200
         )
-        raw = re.sub(r"```json|```", "", res.choices[0].message.content.strip()).strip()
-        parsed = json.loads(raw)
+        raw = re.sub(r"```json|```", "", message_content(res)).strip()
+        if not raw:
+            raise ValueError("empty LLM scoring response")
+        parsed = _extract_json_object(raw)
+        if not parsed:
+            raise ValueError(f"unparseable scoring JSON: {raw[:80]}")
         
         # Validate and clamp score
         score = max(0, min(10, int(parsed.get("score", 0))))
@@ -203,11 +272,12 @@ class VoiceStateMachine:
     - Intro + hook in ONE turn (saves a full round-trip)
     """
 
-    def __init__(self, bot_type: str, customer_name: str = "", customer_category: str = ""):
+    def __init__(self, bot_type: str, customer_name: str = "", customer_category: str = "", agent_name: str = "Riya"):
         self.state             = CallState.OPENING
         self.bot_type          = bot_type
         self.customer_name     = customer_name or ""
         self.customer_category = customer_category or ""
+        self.agent_name        = agent_name or "Riya"
         self.language_preference = "hinglish"  # Always Hinglish — never changes
         self.scheduled_day     = None
         self.scheduled_time    = None
@@ -215,6 +285,9 @@ class VoiceStateMachine:
         self.total_turns       = 0   # Hard limit guard
         self.recovery_count    = 0   # Track hard refusals/hesitations
         self.has_pivoted       = False # Ensure pivot only happens once
+        self.welcome_interrupted = False  # User barged in during welcome
+        self.bot_was_interrupted = False  # User barged in during bot reply
+        self.welcome_spoken      = ""     # What was actually said in welcome (for context)
         self.chat_history      = []  # Trimmed to last 10 msgs for LLM context
         self.full_transcript   = []  # NEVER trimmed — used for scoring + disk logging
         self._initialize_persona()
@@ -306,6 +379,56 @@ OUTPUT RULES:
             "and don't say 'समझ सकती/सकता हूँ' again if you already used it this call. Stay in Hinglish.)"
         )
 
+    def get_turn_context(self, user_text: str) -> str:
+        """Inject live call-awareness so the LLM doesn't act stateless after interruptions."""
+        parts = []
+        utterance = classify_utterance(user_text)
+
+        if self.welcome_interrupted:
+            parts.append(
+                "LIVE CALL CONTEXT: You were interrupted mid-intro — the customer may NOT have heard "
+                "your full opening. Do NOT assume they know why you called."
+            )
+        if self.bot_was_interrupted:
+            parts.append(
+                "LIVE CALL CONTEXT: The customer interrupted you while you were speaking. "
+                "Respond to what THEY just said — do NOT repeat your previous sentence."
+            )
+        if utterance == "greeting":
+            parts.append(
+                f'The customer said "{user_text}" — a simple greeting/acknowledgement, NOT a deep answer. '
+                "Acknowledge naturally ('हाँ जी!', 'जी बोलिए!'), then move ONE step forward. "
+                "Do NOT launch into a credibility pitch or benefit as if they already engaged."
+            )
+        elif utterance == "identity":
+            parts.append(
+                f'The customer asked who you are / why you called: "{user_text}". '
+                f'Answer clearly: you are {self.agent_name} from Kalpvruksh Finserv Pune + one-line reason. '
+                "Do NOT pitch yet."
+            )
+        elif utterance == "busy":
+            parts.append(
+                f'The customer sounds busy: "{user_text}". '
+                "Acknowledge, offer WhatsApp or callback later, keep it under 15 words."
+            )
+        elif utterance == "hard_refusal":
+            parts.append(
+                f'The customer refused: "{user_text}". '
+                "Thank them warmly and append [CALL_END]. Do NOT argue or pitch."
+            )
+
+        if self.welcome_spoken:
+            parts.append(f'Your welcome opener was: "{self.welcome_spoken[:120]}..."')
+
+        return " ".join(parts)
+
+    def _why_called_line(self) -> str:
+        if self.bot_type == "insurance":
+            return "आपके health cover पर एक ज़रूरी बात बतानी थी"
+        if self.bot_type == "recruitment":
+            return "एक extra income का आसान मौका बताना था"
+        return "आपके पैसे बढ़ाने का एक आसान तरीका बताना था"
+
     def post_process_response(self, bot_text: str):
         """
         Called AFTER the main LLM responds. Handles state transitions
@@ -347,11 +470,33 @@ OUTPUT RULES:
         """
         self.total_turns += 1
         lang = self._hinglish_note()
+        utterance = classify_utterance(user_text)
 
         # Hard turn limit — cost control and troll protection
         if self.total_turns >= 15:
             self.state = CallState.HANGUP
             return f"The call has gone on too long. Thank them genuinely for their time and say goodbye warmly. {lang} Append [CALL_END]."
+
+        # Global early exits — identity, busy, hard refusal override state
+        if utterance == "hard_refusal":
+            self.state = CallState.HANGUP
+            return (
+                f"The customer clearly refused: \"{user_text}\". {lang} "
+                "Thank them warmly for their time. Do NOT argue. Append [CALL_END]."
+            )
+        if utterance == "identity":
+            why = self._why_called_line()
+            return (
+                f'The customer asked who you are / why you called: "{user_text}". {lang} '
+                f'Answer in ONE line: "जी, मैं {self.agent_name} बोल रही हूँ — Kalpvruksh Finserv, Pune से। {why}।" '
+                "Do NOT pitch benefits yet. Do NOT repeat नमस्ते."
+            )
+        if utterance == "busy" and self.state in (CallState.OPENING, CallState.CHECK_PERMISSION):
+            self.state = CallState.HANGUP
+            return (
+                f'The customer is busy: "{user_text}". {lang} '
+                "Acknowledge warmly, say you'll call back or send details on WhatsApp. Append [CALL_END]."
+            )
 
         # After repeated hesitation, stop pushing — but NEVER switch to another product/program.
         # Offer a low-pressure WhatsApp follow-up or callback, then bow out warmly.
@@ -365,10 +510,18 @@ OUTPUT RULES:
             )
 
         # ── OPENING ─────────────────────────────────────────────────
-        # You ALREADY greeted + said who you are + why you called in the opener.
-        # Do NOT re-introduce, and do NOT pitch/ask yet — first make them comfortable.
         if self.state == CallState.OPENING:
             self.state = CallState.CHECK_PERMISSION
+
+            # User barged in with just "hello" — finish intro naturally, don't jump to credibility pitch
+            if utterance == "greeting" and self.welcome_interrupted:
+                why = self._why_called_line()
+                return (
+                    f'The customer interrupted your intro and just said "{user_text}". {lang} '
+                    f'Acknowledge warmly ("हाँ जी!" or "जी बोलिए!"), then finish your intro in ONE line: '
+                    f'you are {self.agent_name} from Kalpvruksh Finserv Pune — {why}. '
+                    'Ask if they have two minutes. Do NOT repeat नमस्ते. Do NOT launch into credibility stats yet.'
+                )
 
             if self.bot_type == "insurance":
                 credibility = "Kalpvruksh Finserv, Pune की trusted health-insurance advisory firm है — 2011 से, 500+ families का भरोसा"
@@ -383,14 +536,22 @@ OUTPUT RULES:
                 f"{credibility}. "
                 "Do NOT ask a discovery question or pitch numbers yet — just build warmth and trust this turn. "
                 "NEVER ask where/how they keep their money, which bank, or about their FD/existing investments — that feels intrusive. "
-                "If they ask who you are → say it once, simply. If they say no/busy → offer to call later, then [CALL_END]. "
+                "If they just said hello/hi/haan → acknowledge first, then credibility. "
+                "If they say no/busy → offer to call later, then [CALL_END]. "
                 "Keep it under 20 words. Simple words only."
             )
 
         # ── CHECK_PERMISSION ─────────────────────────────────────────
-        # One turn only — the LLM reads the user's reaction and decides how to proceed
         if self.state == CallState.CHECK_PERMISSION:
             self.state = CallState.QUALIFY  # Optimistic advance
+
+            # Greeting-only after credibility would feel dumb — treat as soft engagement
+            if utterance == "greeting":
+                return (
+                    f'The customer responded with a simple acknowledgement: "{user_text}". {lang} '
+                    "They heard you. Now pitch ONE concrete benefit with a real number/fact — "
+                    "sell, don't interrogate. Do NOT repeat your credibility line."
+                )
 
             if self.bot_type == "insurance":
                 return (

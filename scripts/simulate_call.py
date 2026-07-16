@@ -23,8 +23,9 @@ from pathlib import Path
 # Ensure the project root is importable when run as `python scripts/simulate_call.py`
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from server.voice_state_machine import VoiceStateMachine, CallState  # noqa: E402
-from server.llm_client import complete as _llm_complete  # noqa: E402
+from server.config import config  # noqa: E402
+from server.voice_state_machine import VoiceStateMachine, CallState, classify_utterance  # noqa: E402
+from server.llm_client import complete as _llm_complete, message_content  # noqa: E402
 from server.voice_pipeline import _clean_speak_text  # noqa: E402
 
 # Phrases that reveal a recruitment/extra-income pivot leaking into a non-recruitment call.
@@ -35,11 +36,44 @@ PIVOT_MARKERS = re.compile(
 )
 
 
+def _fallback_bot_text(sm: VoiceStateMachine, user_text: str) -> str:
+    """Mirror production fallback when the LLM returns empty content."""
+    agent = sm.agent_name or config.AGENT_NAME
+    if sm.bot_type == "insurance":
+        why = "health cover पर एक बात थी"
+    elif sm.bot_type == "recruitment":
+        why = "एक business opportunity के बारे में था"
+    else:
+        why = "आपकी savings बढ़ाने के बारे में था"
+
+    utterance = classify_utterance(user_text)
+    if utterance == "greeting":
+        return f"हाँ जी! मैं {agent}, Kalpvruksh Finserv Pune से — {why}। दो मिनट हैं आपके पास?"
+    if utterance == "identity":
+        return f"जी, मैं {agent} बोल रही हूँ — Kalpvruksh Finserv, Pune से। {why.capitalize()}।"
+    if utterance == "busy":
+        return f"कोई बात नहीं, मैं बाद में call करूँगी या WhatsApp पर details भेज दूँगी।"
+    if utterance == "hard_refusal":
+        return "ठीक है, धन्यवाद। नमस्ते! [CALL_END]"
+    return f"जी, मैं {agent}, Kalpvruksh Finserv Pune से बोल रही हूँ। {why.capitalize()} — सुन सकती हैं आप?"
+
+
 async def run_call(bot_type, user_turns, customer_name="Amit", label=""):
-    sm = VoiceStateMachine(bot_type=bot_type, customer_name=customer_name, customer_category="")
+    sm = VoiceStateMachine(
+        bot_type=bot_type,
+        customer_name=customer_name,
+        customer_category="",
+        agent_name=config.AGENT_NAME,
+    )
     # Simulate the welcome already spoken (pipeline does this before the first user turn).
+    welcome = (
+        f"नमस्ते {customer_name} जी, मैं {config.AGENT_NAME}, Kalpvruksh Finserv Pune से। "
+        "आपके पैसे बढ़ाने का एक आसान तरीका बताना था — दो मिनट हैं आपके पास?"
+    )
     sm.state = CallState.OPENING
-    sm.chat_history.append({"role": "assistant", "content": f"नमस्ते {customer_name} जी, मैं Riya, Kalpvruksh Finserv Pune से।"})
+    sm.welcome_spoken = welcome
+    sm.chat_history.append({"role": "assistant", "content": welcome})
+    sm.full_transcript.append({"role": "assistant", "content": welcome})
 
     print(f"\n{'='*70}\n{label}  [bot={bot_type}]\n{'='*70}")
     pivot_hits = []
@@ -52,9 +86,20 @@ async def run_call(bot_type, user_turns, customer_name="Amit", label=""):
             sm.chat_history = [sm.chat_history[0]] + sm.chat_history[-10:]
 
         instruction = sm.get_instruction_for_current_state(user_text=user_text)
-        messages = list(sm.chat_history) + [{"role": "system", "content": instruction}]
+        turn_context = sm.get_turn_context(user_text)
+        sm.welcome_interrupted = False
+        sm.bot_was_interrupted = False
+
+        messages = list(sm.chat_history)
+        if turn_context:
+            messages.append({"role": "system", "content": turn_context})
+        messages.append({"role": "system", "content": instruction})
+
         resp = await _llm_complete(messages, temperature=0.5, max_tokens=100)
-        bot_text = resp.choices[0].message.content.strip()
+        bot_text = message_content(resp)
+        if not bot_text:
+            bot_text = _fallback_bot_text(sm, user_text)
+            print("   ⚠️ LLM empty — using fallback")
         speak = _clean_speak_text(bot_text)
         sm.post_process_response(bot_text)
         sm.chat_history.append({"role": "assistant", "content": speak or bot_text})
