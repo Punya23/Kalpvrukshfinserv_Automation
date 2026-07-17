@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 _GREETING_ONLY = re.compile(
     r"^(hello|hi|hey|hii|namaste|namaskar|haan|ha|hmm|hm|bolo|boliye|bolo na|"
     r"yes|yeah|yep|speak|sun|suniye|sun rahe|sun rahi|ok|okay|theek|thik|"
+    r"achha|acha|accha|अच्छा|"
     r"हाँ|हां|जी|बोलिए|बोलो|नमस्ते|सुन|ठीक)\b",
     re.I,
 )
@@ -59,11 +60,15 @@ def classify_utterance(text: str) -> str:
         return "identity"
     if _BUSY_REFUSAL.search(tl):
         return "busy"
+    # NOTE: regex \b fails for Devanagari words ending in a combining mark (हां, अच्छा),
+    # so the substring list below — not _GREETING_ONLY — is what actually catches
+    # Devanagari greetings/passive acks. Keep passive backchannels here.
     words = tl.split()
     if _GREETING_ONLY.match(tl) or (len(words) <= 3 and any(
         w in tl for w in (
             "hello", "hi", "haan", "हाँ", "हां", "ji", "जी", "namaste", "नमस्ते",
             "boliye", "बोलिए", "bolo", "बोलो", "sun", "सुन",
+            "achha", "acha", "accha", "अच्छा", "ok", "okay", "hmm", "theek", "ठीक",
         )
     )):
         return "greeting"
@@ -309,6 +314,7 @@ class VoiceStateMachine:
         self.scheduled_day     = None
         self.scheduled_time    = None
         self.qualify_turns     = 0   # Turns spent in QUALIFY — gates appointment offer
+        self.engaged_turns     = 0   # Substantive user turns — real interest, gates the meeting offer
         self.total_turns       = 0   # Hard limit guard
         self.recovery_count    = 0   # Track hard refusals/hesitations
         self.has_pivoted       = False # Ensure pivot only happens once
@@ -501,6 +507,12 @@ OUTPUT RULES:
         lang = self._hinglish_note()
         utterance = classify_utterance(user_text)
 
+        # Track REAL engagement (a substantive turn), separate from passive backchannels
+        # ("haan"/"achha"/"boliye"). Gates the founder-meeting offer so we don't pitch a
+        # meeting to someone who never actually engaged.
+        if utterance == "substantive":
+            self.engaged_turns += 1
+
         # Hard turn limit — cost control and troll protection
         if self.total_turns >= 15:
             self.state = CallState.HANGUP
@@ -624,8 +636,12 @@ OUTPUT RULES:
         elif self.state == CallState.QUALIFY:
             self.qualify_turns += 1
 
-            # After 3+ turns of conversation, transition to appointment offer
-            if self.qualify_turns >= 3:
+            # Offer the founder meeting only once there's a REAL sign of interest (a
+            # substantive turn), not after a fixed turn count. Pushing a meeting on
+            # someone who only said "haan/achha" reads as robotic and gets a hang-up.
+            # Hard-cap at 5 turns so an engaged-but-chatty call still lands the offer.
+            ready_for_offer = (self.qualify_turns >= 3 and self.engaged_turns >= 1) or self.qualify_turns >= 5
+            if ready_for_offer:
                 self.state = CallState.SCHEDULE
                 if self.bot_type == "insurance":
                     return (
@@ -658,41 +674,70 @@ OUTPUT RULES:
                         "Gently offer to send details on WhatsApp or call another time. If they still decline, thank them warmly and append [CALL_END]."
                     )
 
-            # Still in the benefit-selling phase — keep pitching, don't interrogate
+            # Passive backchannel ("haan"/"achha"/"boliye"/silence) — the customer is
+            # listening but NOT engaging. Stacking another benefit here is exactly the
+            # monologue that makes Riya sound like a robot reading bullet points. Instead,
+            # invite them into the conversation with ONE light, non-intrusive question so
+            # it becomes two-way.
+            if utterance in ("greeting", "empty") or not (user_text or "").strip():
+                topic = {
+                    "insurance": "health cover",
+                    "recruitment": "इस मौके",
+                }.get(self.bot_type, "investment/SIP")
+                return (
+                    f'The customer only gave a short, passive reply ("{user_text}") — they are '
+                    f"listening but haven't engaged yet. {lang} Do NOT use their name. "
+                    "Do NOT stack another benefit or pitch — that turns the call into a one-way "
+                    "monologue. Instead, in ONE short line: briefly react, then ask a light, easy, "
+                    f"NON-intrusive question to draw them in — e.g. 'आपका {topic} पे कोई सवाल है?', "
+                    "'ये सुनके कैसा लगा?', or 'आप अभी इसके बारे में सोच रहे हैं क्या?'. "
+                    "NEVER ask where/how they keep their money, which bank, or about their FD/existing policies."
+                )
+
+            # Engaged / substantive turn — REACT to what they actually said first, then
+            # advance ONE step. Never ignore them to recite the next scripted benefit.
             if self.bot_type == "insurance":
                 return (
-                    f"Continue the conversation naturally (turn {self.qualify_turns}/3 before appointment offer). {lang} "
+                    f"Continue the conversation naturally (turn {self.qualify_turns}). {lang} "
                     "Do NOT use their name.\n\n"
-                    "Read the user's last message:\n"
-                    "• If they shared something or engaged → share ANOTHER concrete health-cover benefit/fact, "
-                    "different from what you already used (rising medical costs, cashless network, family floater, quick claims).\n"
-                    "• If they asked a question → answer it directly first, then add ONE more benefit.\n"
-                    "• If hesitant → gently share one relatable insight about health coverage gaps.\n"
-                    "• If they refused → try one recovery angle. If hard refusal → [CALL_END]."
+                    "FIRST respond to what the customer ACTUALLY just said — do not ignore it.\n"
+                    "• If they asked a question → answer it directly and simply in ONE line.\n"
+                    "• If they showed interest → build on THAT with one relevant health-cover point "
+                    "(rising medical costs, cashless network, family floater, quick claims), then ask a "
+                    "light question to keep it two-way ('ये कैसा लगा?').\n"
+                    "• If hesitant → acknowledge warmly, don't push; try a fresh angle or invite their concern.\n"
+                    "• If hard refusal → thank them warmly, [CALL_END].\n\n"
+                    "One idea per turn. Never repeat a benefit you already used. NEVER ask about their "
+                    "current policy/coverage — sell the benefit."
                 )
             elif self.bot_type == "recruitment":
                 return (
-                    f"Continue building rapport (turn {self.qualify_turns}/3). {lang} "
+                    f"Continue building rapport (turn {self.qualify_turns}). {lang} "
                     "Do NOT use their name.\n\n"
-                    "• If engaged → share ANOTHER concrete benefit of the partnership, different from before "
-                    "(recurring commission, zero investment, flexible hours, training/support).\n"
-                    "• If asked a question → answer directly, then add one more benefit.\n"
-                    "• If hesitant → share one insight about the opportunity.\n"
-                    "• If refused → try recovery. Hard refusal → [CALL_END]."
+                    "FIRST respond to what they ACTUALLY just said — don't recite the next scripted point.\n"
+                    "• If they asked a question → answer it directly and simply in ONE line.\n"
+                    "• If interested → build on THAT with one concrete partnership benefit (recurring "
+                    "commission, zero investment, flexible hours, training/support), then ask a light "
+                    "question to keep it two-way.\n"
+                    "• If hesitant → clarify it's not MLM/a job; try a fresh angle or invite their concern.\n"
+                    "• If hard refusal → thank them warmly, [CALL_END].\n\n"
+                    "One idea per turn. Never repeat a benefit you already used."
                 )
             else:  # investment
                 return (
-                    f"Continue the pitch naturally (turn {self.qualify_turns}/3 before appointment offer). {lang} "
+                    f"Continue the conversation naturally (turn {self.qualify_turns}). {lang} "
                     "Do NOT use their name.\n\n"
-                    "Read the user's last message:\n"
-                    "• If they shared something or engaged → share ANOTHER concrete SIP/mutual-fund benefit, "
-                    "different from what you already used (13-14% potential returns, power of compounding, महंगाई से आगे "
-                    "निकलना, starting early, goal-based investing for kids' education or a home).\n"
-                    "• If they asked a question → answer it directly first, then add ONE more benefit.\n"
-                    "• If hesitant → follow S3.5 RECOVERY. Try a fresh benefit angle.\n"
-                    "• If hard refusal (nahi chahiye, remove number) → [CALL_END].\n\n"
-                    "NEVER ask where/how they keep their money, which bank, or about their FD/existing investments. "
-                    "IMPORTANT: Never pitch the same benefit twice. Build on previous context."
+                    "FIRST respond to what the customer ACTUALLY just said — do not ignore it to "
+                    "recite the next scripted benefit.\n"
+                    "• If they asked a question → answer it directly and simply in ONE line.\n"
+                    "• If they showed interest → build on THAT with one relevant SIP/mutual-fund point "
+                    "(13-14% potential returns, power of compounding, beating महंगाई, starting early), "
+                    "then ask a light question to keep it two-way ('ये idea कैसा लगा?').\n"
+                    "• If hesitant/skeptical → acknowledge warmly, don't push; try a fresh angle or "
+                    "invite their concern.\n"
+                    "• If hard refusal (nahi chahiye, remove number) → thank them warmly, [CALL_END].\n\n"
+                    "One idea per turn. NEVER ask where/how they keep their money, which bank, or about "
+                    "their FD/existing investments. Never repeat a benefit you already used."
                 )
 
         # ── SCHEDULE ─────────────────────────────────────────────────
