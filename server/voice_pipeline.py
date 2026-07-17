@@ -220,12 +220,17 @@ class ExotelVoiceConnectionManager:
         with different words (e.g. 'ruko', 'nahi') has low overlap and is preserved.
         """
         spoken = self._current_speech_text or ""
-        t_words = set(re.findall(r"\w+", transcript.lower()))
+        t_words = re.findall(r"\w+", transcript.lower())
         if not spoken or not t_words:
             return False
+        # Only ever suppress a MULTI-word overlap. Short utterances (1-2 words like
+        # "ruko", "haan", "returns kitna") must always get through — dropping a real
+        # short reply as "echo" is exactly the "bot didn't respond" failure.
+        if len(t_words) < 3:
+            return False
         s_words = set(re.findall(r"\w+", spoken.lower()))
-        overlap = len(t_words & s_words) / len(t_words)
-        return overlap >= 0.6
+        overlap = len(set(t_words) & s_words) / len(set(t_words))
+        return overlap >= 0.7
 
     async def _determine_bot_persona(self, start_data: dict):
         """
@@ -552,8 +557,10 @@ class ExotelVoiceConnectionManager:
                 stream = response.get("AudioStream")
                 return stream.read() if stream else None
 
+            _t_tts = asyncio.get_event_loop().time()
             pcm_data = await asyncio.to_thread(fetch_polly)
-            
+            logger.info(f"[Exotel] ⏱️ Polly synth latency: {asyncio.get_event_loop().time() - _t_tts:.2f}s")
+
             if pcm_data:
                 # 8000 samples/sec, 16-bit (2 bytes) = 16000 bytes/sec
                 duration_seconds = len(pcm_data) / 16000.0
@@ -742,7 +749,9 @@ class ExotelVoiceConnectionManager:
                 #    150 tokens (not 100): Groq tokenizes Devanagari at ~1 token/char, so
                 #    100 truncated Hindi replies mid-sentence. _shorten_for_voice() still
                 #    caps the spoken line at 26 words, so this only prevents cutoffs.
+                _t_llm = asyncio.get_event_loop().time()
                 response = await _llm_complete(messages, temperature=0.5, max_tokens=150)
+                logger.info(f"[Exotel] ⏱️ LLM turn latency: {asyncio.get_event_loop().time() - _t_llm:.2f}s")
                 if my_generation != self._generation_id:
                     logger.info("[Exotel] Stale LLM response discarded (user barged in again).")
                     # Undo the user turn appended above: the re-queued barge-in reprocess

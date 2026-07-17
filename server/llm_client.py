@@ -77,6 +77,11 @@ _COOLDOWN_SECS = 180
 _groq_cooldown_until      = 0.0
 _cerebras_cooldown_until  = 0.0
 
+# Per-provider wall-clock cap. On a live phone call a slow/hung provider is dead air;
+# the underlying httpx timeout is 30s, far too long. Cap each attempt so we fail over
+# fast. 6s is generous for a ~150-token reply (Groq/Cerebras normally answer in <2s).
+_LLM_TIMEOUT_SECS = 6.0
+
 
 def _attempt_chain() -> list[tuple]:
     """
@@ -96,9 +101,13 @@ def _attempt_chain() -> list[tuple]:
     if groq_client and now >= _groq_cooldown_until:
         chain.append(("groq", GROQ_PRIMARY_MODEL, groq_client, {}))
 
-    # 2. Cerebras fallback
+    # 2. Cerebras fallback — use the NON-reasoning model (gemma) here, never
+    #    gpt-oss-120b: the reasoning model returns empty content on short-reply
+    #    prompts, so as a fallback it just burns a full round-trip (dead air on a
+    #    live call) before we reach OpenRouter. gemma answers immediately.
     if cerebras_client and now >= _cerebras_cooldown_until:
-        chain.append(("cerebras", config.CEREBRAS_MODEL, cerebras_client, {}))
+        cerebras_model = config.CEREBRAS_MODEL_FALLBACK or config.CEREBRAS_MODEL
+        chain.append(("cerebras", cerebras_model, cerebras_client, {}))
 
     # 3. OpenRouter — ask for fastest provider via throughput sort
     if openrouter_client:
@@ -126,12 +135,15 @@ async def complete(messages, temperature: float = 0.5, max_tokens: int = 150):
     last_empty_resp = None  # kept as a last-resort return if every provider comes back empty
     for i, (label, model, client, extra) in enumerate(chain):
         try:
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                **extra,
+            resp = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **extra,
+                ),
+                timeout=_LLM_TIMEOUT_SECS,
             )
 
             # Reasoning models (e.g. Cerebras gpt-oss-120b) can burn the ENTIRE token
@@ -161,6 +173,10 @@ async def complete(messages, temperature: float = 0.5, max_tokens: int = 150):
 
         except Exception as e:
             last_err = e
+            if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                logger.warning(f"[LLM] {label}:{model} timed out after {_LLM_TIMEOUT_SECS}s — next provider")
+                await asyncio.sleep(0)
+                continue
             err_str = str(e)
             is_rate = "429" in err_str or "rate_limit" in err_str.lower() or "quota" in err_str.lower()
 
