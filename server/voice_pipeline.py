@@ -617,19 +617,23 @@ class ExotelVoiceConnectionManager:
             )
 
         def generate_welcome_message(b_type: str, c_name: str, agent: str) -> str:
-            # CRISP opener: greet + who + why + ask for a moment — all in one
+            # Warm, human opener: greet + who first, THEN a soft reason and a
+            # low-pressure ask. Leading with an instant money pitch ("a way to grow
+            # your money — got 2 min?") reads as a robocall and gets hung up on, so
+            # the reason is softened here and the concrete pitch/credibility is
+            # delivered on the next turn by the state machine.
             is_business = _is_business_name(c_name)
             name_part = f"{_escape_ssml(c_name)} जी, " if (c_name and not is_business) else ""
 
             if b_type == "insurance":
-                why = "आपके health cover पर एक ज़रूरी बात बतानी थी"
+                why = "बस health cover से जुड़ी एक ज़रूरी बात बतानी थी"
             elif b_type == "recruitment":
-                why = "एक extra income का आसान मौका बताना था"
+                why = "बस एक अच्छे मौके की छोटी सी बात करनी थी"
             else:
-                why = "आपके पैसे बढ़ाने का एक आसान तरीका बताना था"
+                why = "बस पैसे से जुड़ी एक अच्छी बात बतानी थी"
 
-            who = f"मैं {_escape_ssml(agent)}, Kalpvruksh Finserv Pune से"
-            opener = f"नमस्ते {name_part}{who}। {why} — दो मिनट हैं आपके पास?"
+            who = f"मैं {_escape_ssml(agent)} बोल रही हूँ, Kalpvruksh Finserv Pune से"
+            opener = f"नमस्ते {name_part}{who}। {why} — एक मिनट देंगे?"
             return f"<speak>{opener}</speak>"
 
         greeting_name = getattr(self, "greeting_name", customer_name)
@@ -674,7 +678,9 @@ class ExotelVoiceConnectionManager:
 
         utterance = classify_utterance(user_text)
         if utterance == "greeting":
-            return f"हाँ जी! मैं {agent}, Kalpvruksh Finserv Pune से — {why}। दो मिनट हैं आपके पास?"
+            # Advance with a short credibility hook — do NOT re-read the intro (parroting
+            # the opener on turn 2 is a top reason callers drop).
+            return "हाँ जी! Kalpvruksh Finserv, Pune की भरोसेमंद firm है — 2011 से families के साथ। छोटी सी बात बताऊँ?"
         if utterance == "identity":
             return f"जी, मैं {agent} बोल रही हूँ — Kalpvruksh Finserv, Pune से। {why.capitalize()}।"
         if utterance == "busy":

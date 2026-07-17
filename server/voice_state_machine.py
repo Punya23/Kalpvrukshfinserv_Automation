@@ -189,6 +189,19 @@ async def classify_bot_type(category: str) -> str:
         return "investment"
 
 
+def _count_substantive_user_turns(transcript: str) -> int:
+    """Count user turns in a transcript string that are real engagement — not a bare
+    greeting/acknowledgement and not empty. Used to stop the scorer inflating a
+    hang-up ('hello' → dropped) into a WARM lead."""
+    count = 0
+    for line in (transcript or "").splitlines():
+        if line.startswith("user:"):
+            txt = line[len("user:"):].strip()
+            if txt and classify_utterance(txt) not in ("greeting", "empty"):
+                count += 1
+    return count
+
+
 async def score_lead_with_llm(transcript: str, bot_type: str = "investment") -> dict:
     """
     LLM-based lead scoring. Called AFTER the call ends (no customer-facing latency).
@@ -213,8 +226,8 @@ SCORING RULES:
 - Score 0-1 (DNC): Customer explicitly said "remove number", was angry/abusive, or said "call mat karna". Do Not Contact.
 
 IMPORTANT: If the customer ENGAGED in conversation (asked questions, gave responses, discussed their finances), they are AT LEAST WARM (score 5+) even if no appointment was booked.
-A call that ended due to technical issues or latency should be scored WARM (5), not COLD.
 A customer who was curious but hesitant is WARM (5-6), not COLD.
+DEAD CALL: If the customer only said a bare greeting ("hello"/"haan") or nothing at all and the call ended right after the intro — i.e. they never actually engaged with the pitch — that is NOT a warm lead. Score it COLD (2) or dead, NOT WARM. Do not inflate a hang-up into a warm lead.
 
 Bot type: {bot_type}
 
@@ -242,11 +255,23 @@ Output JSON:
         category = parsed.get("category", "COLD").upper()
         if category not in ("HOT", "WARM", "COLD", "DNC"):
             category = "COLD"
-        
+
+        interest = parsed.get("interest", "cold")
+
+        # Deterministic anti-inflation guard: if the customer never actually engaged
+        # (only a bare 'hello'/'haan' or silence before the call dropped), the LLM
+        # sometimes still returns WARM 5. A hang-up at the intro is NOT a warm lead —
+        # cap it so the CRM pipeline isn't polluted with false warm leads. A DNC
+        # (explicit opt-out) is left untouched.
+        if category != "DNC" and _count_substantive_user_turns(transcript) == 0:
+            score = min(score, 2)
+            category = "COLD"
+            interest = "dead"
+
         return {
             "score": score,
             "category": category,
-            "interest": parsed.get("interest", "cold"),
+            "interest": interest,
             "objection": parsed.get("objection", "none"),
             "appointment": parsed.get("appointment", "no"),
             "summary": (parsed.get("summary") or "")[:200],
