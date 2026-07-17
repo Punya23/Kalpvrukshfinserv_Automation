@@ -633,6 +633,32 @@ async def get_campaign_status():
     return campaign_runner.get_status()
 
 
+@app.get("/api/call-logs/latest")
+async def get_latest_call_logs(token: str = "", limit: int = 1):
+    """Read-only debug view of the most recent saved call transcripts.
+
+    Gated on the Exotel API token so customer transcripts/PII are not exposed on
+    a public URL. Returns the `limit` newest files from data/call_logs (max 20).
+    """
+    if not config.EXOTEL_API_TOKEN or token != config.EXOTEL_API_TOKEN:
+        return JSONResponse({"error": "unauthorized"}, status_code=403)
+
+    from pathlib import Path
+    log_dir = Path("data/call_logs")
+    if not log_dir.exists():
+        return {"count": 0, "logs": []}
+
+    limit = max(1, min(limit, 20))
+    files = sorted(log_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+    logs = []
+    for fp in files:
+        try:
+            logs.append(json.loads(fp.read_text(encoding="utf-8")))
+        except Exception as e:
+            logs.append({"file": fp.name, "error": str(e)})
+    return {"count": len(logs), "logs": logs}
+
+
 @app.get("/api/calling-status")
 async def calling_status():
     """
