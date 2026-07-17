@@ -69,6 +69,7 @@ def classify_utterance(text: str) -> str:
             "hello", "hi", "haan", "हाँ", "हां", "ji", "जी", "namaste", "नमस्ते",
             "boliye", "बोलिए", "bolo", "बोलो", "sun", "सुन",
             "achha", "acha", "accha", "अच्छा", "ok", "okay", "hmm", "theek", "ठीक",
+            "right", "sure", "fine", "cool", "alright", "yup", "haanji", "हांजी",
         )
     )):
         return "greeting"
