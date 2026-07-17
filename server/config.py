@@ -31,8 +31,9 @@ class Config:
     OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
     OPENROUTER_BASE_URL: str = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
-    # --- Groq (last resort fallback) ---
+    # --- Groq (primary provider) ---
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
     # --- Phase 3 Voice Pipeline (Self-Hosted) ---

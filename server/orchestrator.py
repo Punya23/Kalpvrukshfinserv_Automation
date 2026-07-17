@@ -12,23 +12,28 @@ from server.config import config
 logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------
-# LLM Client Setup — OpenRouter primary, Groq fallback
-# (The voice pipeline uses the shared async llm_client.py;
-#  this sync client is only for the /chat text endpoint.)
+# LLM Client Setup — Groq primary, OpenRouter fallback (mirrors the voice
+# pipeline's provider order in server/llm_client.py). This sync client is only
+# for the /chat text endpoint; the voice pipeline uses the shared async client.
+# We also pin the matching model id — config.LLM_MODEL is a Cerebras model
+# (gpt-oss-120b) that does NOT exist on Groq/OpenRouter and would 404.
 # -------------------------------------------------------
 
 from openai import OpenAI as _OpenAI
 
-if config.OPENROUTER_API_KEY:
+_llm_client = None
+_llm_model = None
+if config.GROQ_API_KEY:
+    from groq import Groq as _Groq
+    _llm_client = _Groq(api_key=config.GROQ_API_KEY)
+    _llm_model = config.GROQ_MODEL
+elif config.OPENROUTER_API_KEY:
     _llm_client = _OpenAI(
         api_key=config.OPENROUTER_API_KEY,
         base_url=config.OPENROUTER_BASE_URL,
     )
-elif config.GROQ_API_KEY:
-    from groq import Groq as _Groq
-    _llm_client = _Groq(api_key=config.GROQ_API_KEY)
+    _llm_model = config.OPENROUTER_MODEL
 else:
-    _llm_client = None
     logger.warning("No LLM client configured — /chat will use keyword fallback")
 
 
@@ -75,7 +80,7 @@ def classify_intent(user_message: str) -> IntentResult:
 
     try:
         response = _llm_client.chat.completions.create(
-            model=config.LLM_MODEL,
+            model=_llm_model,
             messages=[
                 {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -84,7 +89,11 @@ def classify_intent(user_message: str) -> IntentResult:
             max_tokens=300,
         )
 
-        response_text = response.choices[0].message.content.strip()
+        # Guard against None content (reasoning-token exhaustion returns 200 + None)
+        response_text = (response.choices[0].message.content or "").strip()
+        if not response_text:
+            logger.warning("Orchestrator LLM returned empty content — keyword fallback.")
+            return _keyword_classify(user_message)
 
         # Parse JSON response
         # Handle cases where LLM wraps JSON in markdown code blocks

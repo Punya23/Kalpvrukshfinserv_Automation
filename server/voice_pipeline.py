@@ -170,8 +170,9 @@ polly_client = boto3.client(
     region_name=config.AWS_REGION
 )
 
-# LLM completion (OpenRouter primary → Groq fallback) lives in the shared llm_client
-# module, so the pipeline and the post-call scorer share ONE provider/fallback policy.
+# LLM completion (Groq primary → Cerebras → OpenRouter fallback) lives in the shared
+# llm_client module, so the pipeline and the post-call scorer share ONE provider/
+# fallback policy. See server/llm_client.py for the chain + circuit-breakers.
 from server.llm_client import complete as _llm_complete, message_content
 
 
@@ -491,7 +492,18 @@ class ExotelVoiceConnectionManager:
                     polly_params["Text"] = f"<speak>{ssml_text}</speak>"
                     polly_params["TextType"] = "ssml"
 
-                response = polly_client.synthesize_speech(**polly_params)
+                try:
+                    response = polly_client.synthesize_speech(**polly_params)
+                except polly_client.exceptions.InvalidSsmlException:
+                    # The LLM emitted malformed <speak> markup. Rather than let the
+                    # caller hear dead silence, retry once with the tags stripped and
+                    # the raw text re-escaped as safe SSML.
+                    plain = re.sub(r"<[^>]+>", " ", text)
+                    plain = _escape_ssml(re.sub(r"\s{2,}", " ", plain).strip())
+                    logger.warning("[Exotel] Invalid SSML from LLM — retrying as plain text.")
+                    polly_params["Text"] = f"<speak>{plain}</speak>"
+                    polly_params["TextType"] = "ssml"
+                    response = polly_client.synthesize_speech(**polly_params)
                 stream = response.get("AudioStream")
                 return stream.read() if stream else None
 
@@ -545,7 +557,7 @@ class ExotelVoiceConnectionManager:
         return duration_seconds
 
     async def play_welcome_message(self, customer_name: str, bot_type: str):
-        """Play the opening welcome message immediately without calling Groq first, reducing latency.
+        """Play the opening welcome message immediately without calling the LLM first, reducing latency.
         Uses the two-beat sales psychology system for natural pauses and context-aware hooking.
         """
         if not hasattr(self, 'state_machine') or self.state_machine is None:
@@ -624,7 +636,7 @@ class ExotelVoiceConnectionManager:
         return f"जी, मैं {agent}, Kalpvruksh Finserv Pune से बोल रही हूँ। {why.capitalize()} — सुन सकती हैं आप?"
 
     async def process_llm_and_speak(self, user_text: str):
-        """Pass user text to Groq, then to Polly, then stream PCM back to Exotel.
+        """Pass user text to the LLM, then to Polly, then stream PCM back to Exotel.
         Detects [CALL_END] tag in LLM output and triggers hangup after final audio.
         """
         if self.call_ended:
@@ -673,7 +685,10 @@ class ExotelVoiceConnectionManager:
 
                 # 2. Get LLM response — auto-falls back to a higher-limit model on
                 #    rate-limit/error so a quota hit degrades quality, not drops the call.
-                response = await _llm_complete(messages, temperature=0.5, max_tokens=100)
+                #    150 tokens (not 100): Groq tokenizes Devanagari at ~1 token/char, so
+                #    100 truncated Hindi replies mid-sentence. _shorten_for_voice() still
+                #    caps the spoken line at 26 words, so this only prevents cutoffs.
+                response = await _llm_complete(messages, temperature=0.5, max_tokens=150)
                 if my_generation != self._generation_id:
                     logger.info("[Exotel] Stale LLM response discarded (user barged in again).")
                     return

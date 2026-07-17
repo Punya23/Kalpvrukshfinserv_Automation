@@ -37,6 +37,7 @@ class SheetsManager:
     def __init__(self):
         self._client = None
         self._spreadsheet = None
+        self._warned_no_creds = False  # warn once, not on every call
         self._local_fallback_dir = config.DATA_DIR / "local_sheets"
         self._local_fallback_dir.mkdir(parents=True, exist_ok=True)
 
@@ -71,7 +72,12 @@ class SheetsManager:
                 self._client = gspread.authorize(credentials)
                 return self._client
                 
-            logger.warning("No Google Sheets credentials found. Need either authorized_user.json or service_account.json")
+            if not self._warned_no_creds:
+                logger.warning(
+                    "No Google Sheets credentials found (need authorized_user.json or "
+                    "service_account.json) — using local JSON fallback for all leads."
+                )
+                self._warned_no_creds = True
             return None
             
         except Exception as e:

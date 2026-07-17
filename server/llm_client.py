@@ -1,18 +1,22 @@
 """
 Shared LLM clients + a resilient, LOW-LATENCY completion helper.
 
-Provider chain (fastest → most available):
+Provider chain (3 providers, tried in order):
 
-  Primary : Cerebras   — ultra-fast free inference (~2-5x faster than Groq)
-                         Models: llama-3.3-70b, llama3.1-8b, llama3.1-70b
-                         Base URL: https://api.cerebras.ai/v1 (OpenAI-compatible)
-  Fallback: OpenRouter — no daily quota, routes to fastest available provider
-                         (Cerebras/Groq/SambaNova) via throughput sort
-  Last    : Groq 70B   — separate free tier, kept as final safety net
-            Groq 8B    — highest free daily cap, absolute last resort
+  Primary : Groq        — fast free inference; if it exhausts its token budget
+                          or errors, fall through automatically.
+                          Model: llama-3.3-70b-versatile (override via GROQ_MODEL)
+  Fallback: Cerebras    — ultra-fast free inference (OpenAI-compatible).
+                          Base URL: https://api.cerebras.ai/v1
+  Last    : OpenRouter  — no daily quota, routes to fastest available provider
+                          (Cerebras/Groq/SambaNova) via throughput sort
 
-Circuit-breaker on Cerebras: if it hits its rate-limit, skip it for 3 min
-so we don't waste ~0.2s probing a known-throttled endpoint every turn.
+Fall-through is automatic on either (a) an API error/rate-limit or (b) a
+"successful" call that returns empty content because the model burned its whole
+token budget on hidden reasoning (finish_reason=length) — see complete().
+
+Circuit-breakers: if Groq or Cerebras hits its rate-limit, skip it for 3 min so
+we don't waste ~0.2s probing a known-throttled endpoint every turn.
 
 Both the voice pipeline and the post-call scorer import `complete()` from here.
 """
@@ -64,39 +68,40 @@ if config.GROQ_API_KEY:
     except ImportError:
         logger.warning("[LLM] groq package not installed — Groq fallback unavailable")
 
-GROQ_PRIMARY_MODEL  = config.LLM_MODEL or "llama-3.3-70b-versatile"
-GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"   # separate, higher free daily cap
+# Groq is now the primary. It needs a real Groq model — NOT config.LLM_MODEL,
+# which is a Cerebras model id (gpt-oss-120b) and does not exist on Groq.
+GROQ_PRIMARY_MODEL = config.GROQ_MODEL or "llama-3.3-70b-versatile"
 
 # Circuit-breaker state (monotonic timestamps)
 _COOLDOWN_SECS = 180
+_groq_cooldown_until      = 0.0
 _cerebras_cooldown_until  = 0.0
-_openrouter_cooldown_until = 0.0
 
 
 def _attempt_chain() -> list[tuple]:
     """
     Returns ordered (label, model, client, extra_kwargs) tuples.
-    Both free Cerebras models are tried before falling back to paid providers.
 
-    Order:
-      1. Cerebras gpt-oss-120b  (primary — 120B, best quality)
-      2. Cerebras gemma-4-31b   (secondary — 31B, fast fallback if 120B rate-limited)
-      3. OpenRouter              (no daily quota, routes to fastest available)
-      4. Groq 70B                (free tier)
-      5. Groq 8B                 (highest free daily cap, last resort)
+    Order (3 providers):
+      1. Groq       (primary)   — llama-3.3-70b-versatile
+      2. Cerebras   (fallback)  — used when Groq errors or exhausts its tokens
+      3. OpenRouter (last)      — no daily quota, routes to fastest available
+
+    Providers on rate-limit cooldown are skipped until their window expires.
     """
     now = time.monotonic()
     chain = []
 
-    # 1. Cerebras primary (gpt-oss-120b)
+    # 1. Groq primary
+    if groq_client and now >= _groq_cooldown_until:
+        chain.append(("groq", GROQ_PRIMARY_MODEL, groq_client, {}))
+
+    # 2. Cerebras fallback
     if cerebras_client and now >= _cerebras_cooldown_until:
         chain.append(("cerebras", config.CEREBRAS_MODEL, cerebras_client, {}))
-        # 2. Cerebras fallback (gemma-4-31b) — same client, different model
-        if config.CEREBRAS_MODEL_FALLBACK and config.CEREBRAS_MODEL_FALLBACK != config.CEREBRAS_MODEL:
-            chain.append(("cerebras-fallback", config.CEREBRAS_MODEL_FALLBACK, cerebras_client, {}))
 
-    # 3. OpenRouter fallback — ask for fastest provider via throughput sort
-    if openrouter_client and now >= _openrouter_cooldown_until:
+    # 3. OpenRouter — ask for fastest provider via throughput sort
+    if openrouter_client:
         chain.append((
             "openrouter",
             config.OPENROUTER_MODEL,
@@ -104,19 +109,12 @@ def _attempt_chain() -> list[tuple]:
             {"extra_body": {"provider": {"sort": "throughput"}}},
         ))
 
-    # 4. Groq 70B
-    if groq_client:
-        chain.append(("groq", GROQ_PRIMARY_MODEL, groq_client, {}))
-        # 5. Groq 8B (highest daily cap — absolute last resort)
-        if GROQ_FALLBACK_MODEL != GROQ_PRIMARY_MODEL:
-            chain.append(("groq-8b", GROQ_FALLBACK_MODEL, groq_client, {}))
-
     return chain
 
 
 async def complete(messages, temperature: float = 0.5, max_tokens: int = 150):
     """Low-latency chat completion with provider fallback. Raises only if all providers fail."""
-    global _cerebras_cooldown_until, _openrouter_cooldown_until
+    global _groq_cooldown_until, _cerebras_cooldown_until
 
     chain = _attempt_chain()
     if not chain:
@@ -166,15 +164,18 @@ async def complete(messages, temperature: float = 0.5, max_tokens: int = 150):
             err_str = str(e)
             is_rate = "429" in err_str or "rate_limit" in err_str.lower() or "quota" in err_str.lower()
 
-            if label == "cerebras" and is_rate:
+            if label == "groq" and is_rate:
+                _groq_cooldown_until = time.monotonic() + _COOLDOWN_SECS
+                logger.warning(
+                    f"[LLM] Groq rate-limited — cooling down {_COOLDOWN_SECS}s, "
+                    f"falling back to Cerebras"
+                )
+            elif label == "cerebras" and is_rate:
                 _cerebras_cooldown_until = time.monotonic() + _COOLDOWN_SECS
                 logger.warning(
                     f"[LLM] Cerebras rate-limited — cooling down {_COOLDOWN_SECS}s, "
                     f"falling back to OpenRouter"
                 )
-            elif label == "openrouter" and is_rate:
-                _openrouter_cooldown_until = time.monotonic() + _COOLDOWN_SECS
-                logger.warning(f"[LLM] OpenRouter rate-limited — cooling down {_COOLDOWN_SECS}s")
             else:
                 logger.warning(
                     f"[LLM] {label}:{model} failed "

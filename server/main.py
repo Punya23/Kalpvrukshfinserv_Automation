@@ -673,6 +673,15 @@ async def exotel_stream(websocket: WebSocket):
         logger.info("[Exotel] WebSocket connection closed normally.")
     except Exception as e:
         logger.error(f"[Exotel] WebSocket error: {e}")
+    finally:
+        # On any disconnect (clean or abrupt), tear the call down so background tasks
+        # (Deepgram receive/keepalive, silence watchdog) don't leak and the partial
+        # lead still gets scored. _hangup() is idempotent via the call_ended guard.
+        if not manager.call_ended:
+            try:
+                await manager._hangup()
+            except Exception as e:
+                logger.error(f"[Exotel] Cleanup on disconnect failed: {e}")
 
 
 @app.post("/api/make-call-exotel")
