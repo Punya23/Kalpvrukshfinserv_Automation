@@ -109,7 +109,20 @@ class SheetsManager:
             try:
                 existing = json.loads(filepath.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
+                # Don't silently overwrite — that would discard every previously
+                # logged lead. Preserve the corrupt file for manual recovery, then
+                # start fresh so this write still succeeds.
+                backup = filepath.with_suffix(
+                    f".corrupt-{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                )
+                try:
+                    filepath.rename(backup)
+                    logger.error(f"Corrupt fallback JSON — preserved as {backup}, starting fresh.")
+                except Exception as e:
+                    logger.error(f"Corrupt fallback JSON and backup failed: {e}")
                 existing = []
+        if not isinstance(existing, list):
+            existing = [existing] if existing else []
 
         existing.append(row_data)
         filepath.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -243,19 +256,34 @@ class WhatsAppNotifier:
 
         return await self._send_whatsapp(config.MANAGER_WHATSAPP_NUMBER, message)
 
+    @staticmethod
+    def _fmt_money(value) -> str:
+        """Format a premium as ₹1,23,000-style money, tolerant of str/None values.
+
+        get_all_records() often returns numeric cells as strings (e.g. '5000'),
+        and f"{'5000':,}" raises ValueError — so coerce to int first, and fall
+        back to the raw value if it isn't numeric."""
+        try:
+            return f"{int(float(str(value).replace(',', '').strip())):,}"
+        except (TypeError, ValueError):
+            return str(value) if value not in (None, "") else "N/A"
+
     async def notify_manager_renewal_alert(self, renewal: dict) -> bool:
         """Alert manager about an urgent renewal."""
         days = renewal.get("Days Until Expiry", "?")
-        urgency = "🔴 CRITICAL" if days <= 7 else "🟡 IMPORTANT" if days <= 30 else "🟢 NORMAL"
+        try:
+            urgency = "🔴 CRITICAL" if days <= 7 else "🟡 IMPORTANT" if days <= 30 else "🟢 NORMAL"
+        except TypeError:
+            urgency = "🟡 IMPORTANT"  # days wasn't numeric
 
         message = (
             f"{urgency} *RENEWAL ALERT*\n\n"
-            f"👤 *Customer:* {renewal['Name']} ({renewal['Customer ID']})\n"
-            f"📋 *Policy:* {renewal['Plan']} — {renewal['Insurer']}\n"
-            f"💰 *Premium:* ₹{renewal['Premium']:,}\n"
-            f"📅 *Expiry:* {renewal['Expiry Date']}\n"
+            f"👤 *Customer:* {renewal.get('Name', 'Unknown')} ({renewal.get('Customer ID', 'N/A')})\n"
+            f"📋 *Policy:* {renewal.get('Plan', 'N/A')} — {renewal.get('Insurer', 'N/A')}\n"
+            f"💰 *Premium:* ₹{self._fmt_money(renewal.get('Premium'))}\n"
+            f"📅 *Expiry:* {renewal.get('Expiry Date', 'N/A')}\n"
             f"⏰ *Days Left:* {days}\n\n"
-            f"📞 Call: {renewal['Phone']}"
+            f"📞 Call: {renewal.get('Phone', 'N/A')}"
         )
 
         return await self._send_whatsapp(config.MANAGER_WHATSAPP_NUMBER, message)
@@ -266,10 +294,10 @@ class WhatsAppNotifier:
         message = (
             f"Namaste {customer_name}! 🙏\n\n"
             f"Kalpvruksh Finserv se Vikram bol raha hoon.\n\n"
-            f"Aapki *{policy_details['Plan']}* policy "
-            f"(No: {policy_details['Policy Number']}) ka renewal "
-            f"*{policy_details['Expiry Date']}* ko due hai.\n\n"
-            f"💰 Renewal Premium: *₹{policy_details['Premium']:,}*\n\n"
+            f"Aapki *{policy_details.get('Plan', 'insurance')}* policy "
+            f"(No: {policy_details.get('Policy Number', 'N/A')}) ka renewal "
+            f"*{policy_details.get('Expiry Date', 'N/A')}* ko due hai.\n\n"
+            f"💰 Renewal Premium: *₹{self._fmt_money(policy_details.get('Premium'))}*\n\n"
             f"Renew karne ke liye 'YES' reply karein ya humein call karein.\n\n"
             f"— Kalpvruksh Finserv 🌳"
         )

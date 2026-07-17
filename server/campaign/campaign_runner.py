@@ -80,8 +80,8 @@ class CampaignRunner:
             "status": self.status.value,
             "bot_type": self.bot_type,
             "total_leads": len(self.leads),
-            "calls_made": self.current_index,
-            "calls_remaining": len(self.leads) - self.current_index,
+            "calls_made": len(self.results),
+            "calls_remaining": max(0, len(self.leads) - len(self.results)),
             "results_summary": self._get_results_summary(),
             "calling_status": get_calling_status(),
         }
@@ -150,7 +150,11 @@ class CampaignRunner:
         enforce_optimal_windows: bool = True,
     ) -> dict:
         """Start the campaign. Runs as a background asyncio task."""
-        if self.status == CampaignStatus.RUNNING:
+        # Guard on the live task, not just RUNNING: while sleeping for the next optimal
+        # window the status is WAITING_FOR_WINDOW but the task is still alive. Checking
+        # only RUNNING let a second start() (e.g. the 10 AM auto-campaign cron) spawn a
+        # concurrent loop that double-dials the same leads.
+        if self._current_task and not self._current_task.done():
             return {"error": "Campaign already running", "status": self.get_status()}
 
         self.bot_type = bot_type
@@ -176,13 +180,20 @@ class CampaignRunner:
         return {"message": f"Campaign started with {count} leads", "status": self.get_status()}
 
     def stop(self) -> dict:
-        """Request campaign to stop after current call completes."""
-        if self.status != CampaignStatus.RUNNING:
+        """Request campaign to stop. Works whether it's actively calling OR asleep
+        waiting for the next optimal window."""
+        if not (self._current_task and not self._current_task.done()):
             return {"error": "No campaign running"}
 
+        was_waiting = self.status == CampaignStatus.WAITING_FOR_WINDOW
         self._stop_requested = True
         self.status = CampaignStatus.STOPPED
-        logger.info(f"🛑 Campaign stop requested. Will stop after current call.")
+        # If actively calling, let the current call finish gracefully (loop checks the
+        # flag next iteration). If merely sleeping until the next window, cancel to
+        # break the wait immediately — otherwise stop() couldn't stop it at all.
+        if was_waiting:
+            self._current_task.cancel()
+        logger.info("🛑 Campaign stop requested.")
         return {"message": "Campaign stop requested", "status": self.get_status()}
 
     async def _run_campaign(self):

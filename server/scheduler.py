@@ -7,7 +7,10 @@ and triggers outbound reminder calls/messages.
 import json
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 from server.sheets_manager import sheets_manager, whatsapp_notifier
 from server.config import config
@@ -77,30 +80,34 @@ class RenewalScheduler:
                 
             days_left = renewal.get("Days Until Expiry")
             if days_left is None:
-                # Calculate from expiry date
+                # Calculate from expiry date. Use IST calendar dates (Railway is UTC)
+                # and whole-day date subtraction so a policy expiring "today" is 0, not
+                # -1 from a UTC/floor skew near midnight.
                 try:
-                    expiry = datetime.strptime(renewal["Expiry Date"], "%Y-%m-%d")
-                    days_left = (expiry - datetime.now()).days
+                    expiry = datetime.strptime(renewal["Expiry Date"], "%Y-%m-%d").date()
+                    days_left = (expiry - datetime.now(_IST).date()).days
                 except (ValueError, KeyError):
                     continue
 
-            # Check if this renewal matches any milestone using range-based check
-            for milestone in self.REMINDER_MILESTONES:
+            # Pick the SMALLEST (most urgent) milestone the policy has entered, ascending,
+            # so the escalation series (D-60→D-30→D-15→D-7→D-1) each fires once as the
+            # date approaches. Descending would always match D-60 first and collapse the
+            # whole series into a single reminder.
+            for milestone in sorted(self.REMINDER_MILESTONES):
                 if days_left <= milestone:
                     if not self._already_sent(phone, milestone):
                         await self._send_reminder(renewal, days_left)
                         self._mark_sent(phone, milestone)
                         reminders_sent += 1
-                    break  # Only evaluate the highest applicable milestone
+                    break
 
-            # Also handle overdue (grace period)
+            # Also handle overdue (grace period). ONE alert per lapsed policy — a
+            # per-day key (overdue_1, overdue_2, …) is never-before-seen every day and
+            # would spam up to 30 "URGENT" messages for a single policy.
             if -30 <= days_left < 0:
-                # Use milestone "overdue" to track if sent today or track uniquely
-                # Let's track overdue messages too
-                overdue_milestone = f"overdue_{abs(days_left)}"
-                if not self._already_sent(phone, overdue_milestone):
+                if not self._already_sent(phone, "overdue"):
                     await self._send_overdue_alert(renewal, abs(days_left))
-                    self._mark_sent(phone, overdue_milestone)
+                    self._mark_sent(phone, "overdue")
                     reminders_sent += 1
 
         logger.info(f"✅ Renewal check complete. {reminders_sent} reminders sent.")

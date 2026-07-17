@@ -235,8 +235,10 @@ Output JSON:
         if not parsed:
             raise ValueError(f"unparseable scoring JSON: {raw[:80]}")
         
-        # Validate and clamp score
-        score = max(0, min(10, int(parsed.get("score", 0))))
+        # Validate and clamp score. `or 0` guards against a null/"" score field
+        # (key present → .get default is skipped → int(None) would raise and wrongly
+        # bucket an engaged HOT lead as COLD via the except handler).
+        score = max(0, min(10, int(parsed.get("score") or 0)))
         category = parsed.get("category", "COLD").upper()
         if category not in ("HOT", "WARM", "COLD", "DNC"):
             category = "COLD"
@@ -247,7 +249,7 @@ Output JSON:
             "interest": parsed.get("interest", "cold"),
             "objection": parsed.get("objection", "none"),
             "appointment": parsed.get("appointment", "no"),
-            "summary": parsed.get("summary", "")[:200],
+            "summary": (parsed.get("summary") or "")[:200],
         }
     except Exception as e:
         logger.error(f"score_lead_with_llm error: {e}")
@@ -442,7 +444,9 @@ OUTPUT RULES:
         if appointment_match:
             raw_day = appointment_match.group(1).strip()
             raw_time = appointment_match.group(2).strip()
-            self.scheduled_day = raw_day
+            # The LLM is asked for YYYY-MM-DD but often emits "kal"/"Monday" —
+            # normalize so the CRM/callback gets a real date, not raw natural text.
+            self.scheduled_day = normalize_scheduled_date(raw_day) or raw_day
             self.scheduled_time = normalize_scheduled_time(raw_time) if raw_time else raw_time
             if self.state not in (CallState.CONFIRM, CallState.HANGUP):
                 self.state = CallState.CONFIRM
@@ -681,7 +685,7 @@ OUTPUT RULES:
                 "acknowledge warmly, say you'll send details on WhatsApp, and append [CALL_END].\n"
                 "• If they changed their mind → acknowledge, try one gentle recovery. "
                 "If still no → append [CALL_END].\n\n"
-                "Today is " + datetime.now().strftime("%A, %d %B %Y") + "."
+                "Today is " + datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%A, %d %B %Y") + "."
             )
 
         # ── CONFIRM ──────────────────────────────────────────────────

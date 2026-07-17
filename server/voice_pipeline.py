@@ -207,8 +207,25 @@ class ExotelVoiceConnectionManager:
         self.outbound_timestamp_ms = 0
         self.last_speak_finished_time = 0.0
         self.customer_category = ""
+        self._current_speech_text = ""  # what the bot is saying right now (for echo suppression)
 
         self.state_machine = None
+
+    def _looks_like_echo(self, transcript: str) -> bool:
+        """True when an incoming 'user' transcript is really the bot's own TTS echoing
+        back on the phone line. Inbound audio is forwarded to Deepgram even while the
+        bot speaks, so without this a fragment of the bot's own words gets mistaken for
+        a barge-in and the bot cuts itself off. We flag it as echo only when most of the
+        transcript's words are words the bot is currently speaking — a genuine barge-in
+        with different words (e.g. 'ruko', 'nahi') has low overlap and is preserved.
+        """
+        spoken = self._current_speech_text or ""
+        t_words = set(re.findall(r"\w+", transcript.lower()))
+        if not spoken or not t_words:
+            return False
+        s_words = set(re.findall(r"\w+", spoken.lower()))
+        overlap = len(t_words & s_words) / len(t_words)
+        return overlap >= 0.6
 
     async def _determine_bot_persona(self, start_data: dict):
         """
@@ -337,13 +354,20 @@ class ExotelVoiceConnectionManager:
             logger.error(f"[Exotel] Failed to connect to Deepgram: {e}")
 
     async def deepgram_keepalive(self):
-        """Send periodic KeepAlive messages to Deepgram to prevent timeout."""
+        """Send periodic KeepAlive messages to Deepgram to prevent timeout.
+
+        Bound to the specific socket live when it starts: after a reconnect
+        self.deepgram_ws points to a NEW socket, so the old keepalive's
+        `self.deepgram_ws is ws` check fails and it exits instead of leaking a
+        task that keeps pinging (one extra keepalive per reconnect otherwise).
+        """
+        ws = self.deepgram_ws
         try:
-            while self.deepgram_ws and not self.call_ended:
+            while ws and self.deepgram_ws is ws and not self.call_ended:
                 await asyncio.sleep(5)
-                if self.deepgram_ws and not self.call_ended:
+                if self.deepgram_ws is ws and not self.call_ended:
                     logger.debug("[Exotel] Sending KeepAlive to Deepgram")
-                    await self.deepgram_ws.send(json.dumps({"type": "KeepAlive"}))
+                    await ws.send(json.dumps({"type": "KeepAlive"}))
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -365,11 +389,19 @@ class ExotelVoiceConnectionManager:
             if self.call_ended:
                 return
 
-            # Ask if they're still there — Devanagari for correct Polly pronunciation
+            # Ask if they're still there — Devanagari for correct Polly pronunciation.
+            # Guard is_bot_speaking so a user reply during this prompt is treated as a
+            # barge-in (not a fresh turn) and can't spawn a second, overlapping audio
+            # stream on top of the watchdog's own _speak_text.
             logger.info("[Exotel] Silence detected (45s). Prompting user...")
-            await self._speak_text(
-                '<speak>Hello? <break time="400ms"/> आप सुन रहे हैं?</speak>'
-            )
+            self.is_bot_speaking = True
+            try:
+                await self._speak_text(
+                    '<speak>Hello? <break time="400ms"/> आप सुन रहे हैं?</speak>'
+                )
+            finally:
+                self.is_bot_speaking = False
+                self.last_speak_finished_time = asyncio.get_event_loop().time()
 
             # Wait 15 more seconds for a response
             await asyncio.sleep(15)
@@ -378,10 +410,14 @@ class ExotelVoiceConnectionManager:
 
             # Still no response — hang up
             logger.info("[Exotel] No response after silence prompt. Hanging up.")
-            await self._speak_text(
-                '<speak>लगता है connection में कोई issue है। <break time="300ms"/> '
-                'मैं बाद में call करूँगी। <break time="200ms"/> नमस्ते!</speak>'
-            )
+            self.is_bot_speaking = True
+            try:
+                await self._speak_text(
+                    '<speak>लगता है connection में कोई issue है। <break time="300ms"/> '
+                    'मैं बाद में call करूँगी। <break time="200ms"/> नमस्ते!</speak>'
+                )
+            finally:
+                self.is_bot_speaking = False
             await asyncio.sleep(3)  # Let the audio play
             await self._hangup()
 
@@ -429,7 +465,13 @@ class ExotelVoiceConnectionManager:
                                 if getattr(self, 'state_machine', None) and self.state_machine.state == CallState.HANGUP:
                                     logger.info(f"[Exotel] Ignoring barge-in '{clean_transcript}' because call is in final goodbye.")
                                     continue
-                                
+
+                                # Ignore the bot's own TTS echoing back on the line —
+                                # otherwise the bot cuts itself off mid-sentence.
+                                if self._looks_like_echo(clean_transcript):
+                                    logger.info(f"[Exotel] Ignoring likely echo of own speech: '{clean_transcript}'")
+                                    continue
+
                                 # Barge-in: interrupt bot speech and queue this utterance
                                 self.welcome_interrupted = True
                                 self.barge_in_transcript = clean_transcript
@@ -469,6 +511,9 @@ class ExotelVoiceConnectionManager:
         Automatically detects SSML markup (<speak> tags) and tells Polly to parse it.
         """
         duration_seconds = 0.0
+        # Record the plain words we're about to speak so barge-in echo suppression
+        # (_looks_like_echo) can tell the bot's own TTS apart from a real interruption.
+        self._current_speech_text = re.sub(r"<[^>]+>", " ", text)
         try:
             # Detect whether the text is SSML (wrapped in <speak> tags)
             is_ssml = text.strip().startswith("<speak>") and text.strip().endswith("</speak>")
@@ -554,6 +599,9 @@ class ExotelVoiceConnectionManager:
                 logger.debug(f"[Exotel] Streamed {len(pcm_chunks)} chunks (~{duration_seconds:.1f}s audio)")
         except Exception as e:
             logger.error(f"[Exotel] _speak_text error: {e}")
+        finally:
+            # Done speaking — post-speech echo is now handled by the 1.2s cooldown.
+            self._current_speech_text = ""
         return duration_seconds
 
     async def play_welcome_message(self, customer_name: str, bot_type: str):
@@ -691,6 +739,13 @@ class ExotelVoiceConnectionManager:
                 response = await _llm_complete(messages, temperature=0.5, max_tokens=150)
                 if my_generation != self._generation_id:
                     logger.info("[Exotel] Stale LLM response discarded (user barged in again).")
+                    # Undo the user turn appended above: the re-queued barge-in reprocess
+                    # will append the new utterance, so leaving this one creates two
+                    # consecutive user turns (corrupts context + scoring).
+                    if self.state_machine.chat_history and self.state_machine.chat_history[-1].get("role") == "user":
+                        self.state_machine.chat_history.pop()
+                    if self.state_machine.full_transcript and self.state_machine.full_transcript[-1].get("role") == "user":
+                        self.state_machine.full_transcript.pop()
                     return
                 bot_text = message_content(response)
                 if not bot_text:
@@ -902,7 +957,13 @@ class ExotelVoiceConnectionManager:
         if self.call_ended:
             return
 
-        data = json.loads(message)
+        # Guard per-frame: a single malformed frame must skip, not crash the receive
+        # loop in main.py (which would break out and hang up the whole call).
+        try:
+            data = json.loads(message)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"[Exotel] Ignoring non-JSON frame: {str(message)[:80]!r}")
+            return
         event = data.get("event")
 
         if event == "connected":

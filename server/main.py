@@ -3,6 +3,7 @@ Kalpvruksh Finserv AI Automation — Main Server
 FastAPI application with webhook routes for WhatsApp, Voice AI, and testing.
 """
 
+import asyncio
 import json
 import logging
 import uuid
@@ -175,6 +176,7 @@ async def run_nightly_scrape():
             ]:
                 retry_count = 0
                 max_retries = 2
+                got_data = False  # tracks success per endpoint (never read a stale resp)
                 while retry_count <= max_retries:
                     try:
                         resp = _req.post(
@@ -187,6 +189,7 @@ async def run_nightly_scrape():
                         if resp.status_code == 200 and resp.text.strip():
                             elements = resp.json().get("elements", [])
                             all_elements.extend(elements)
+                            got_data = True
                             break  # Got data — don't try mirror
                         elif resp.status_code == 429:
                             retry_count += 1
@@ -199,9 +202,11 @@ async def run_nightly_scrape():
                         else:
                             break # Other errors, break retry loop and try mirror
                     except Exception as e:
+                        # First request can raise before `resp` is ever bound — a
+                        # success flag (not resp.status_code) is the safe signal.
                         logger.warning(f"[Scraper/Overpass] {endpoint} failed: {e}")
                         break # Request exception, try mirror
-                if retry_count <= max_retries and resp.status_code == 200:
+                if got_data:
                     break # Success, break endpoint loop
             _time.sleep(5)  # Be polite between Overpass queries
         return all_elements
@@ -395,8 +400,10 @@ async def chat(request: ChatRequest):
         intent = request.bot_type.upper()
         confidence = 1.0
     else:
-        # Use orchestrator to classify intent
-        intent_result = classify_intent(request.message)
+        # Use orchestrator to classify intent. classify_intent is a SYNC function
+        # that makes a blocking LLM network call — run it off the event loop so it
+        # doesn't freeze concurrent voice WebSockets / campaign timers.
+        intent_result = await asyncio.to_thread(classify_intent, request.message)
         intent = intent_result.intent
         confidence = intent_result.confidence
         logger.info(f"Orchestrator: {intent} (confidence: {confidence:.2f}) — {intent_result.reason}")
@@ -736,7 +743,11 @@ async def make_call_exotel(payload: MakeCallRequest):
     form_data["CustomField"] = json.dumps(custom_params)
 
     try:
-        response = requests.post(url, data=form_data, timeout=30)
+        # requests.post is blocking — run it off the event loop so triggering an
+        # outbound call doesn't stall live voice WebSockets for up to 30s.
+        response = await asyncio.to_thread(
+            lambda: requests.post(url, data=form_data, timeout=30)
+        )
         logger.info(f"[Exotel] Call API response ({response.status_code}): {response.text[:300]}")
 
         if response.status_code == 200:

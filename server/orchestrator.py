@@ -26,7 +26,7 @@ _llm_model = None
 if config.GROQ_API_KEY:
     from groq import Groq as _Groq
     _llm_client = _Groq(api_key=config.GROQ_API_KEY)
-    _llm_model = config.GROQ_MODEL
+    _llm_model = config.GROQ_MODEL or "llama-3.3-70b-versatile"
 elif config.OPENROUTER_API_KEY:
     _llm_client = _OpenAI(
         api_key=config.OPENROUTER_API_KEY,
@@ -104,9 +104,17 @@ def classify_intent(user_message: str) -> IntentResult:
 
         parsed = json.loads(response_text)
 
+        # The LLM sometimes returns confidence as a string ("0.9" / "high") — coerce
+        # to float so downstream `f"{confidence:.2f}"` formatting can't raise. Also
+        # upper-case the intent so a lowercased "insurance" still routes correctly.
+        try:
+            confidence = float(parsed.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+
         return IntentResult(
-            intent=parsed.get("intent", "UNKNOWN"),
-            confidence=parsed.get("confidence", 0.5),
+            intent=str(parsed.get("intent", "UNKNOWN")).upper(),
+            confidence=confidence,
             reason=parsed.get("reason", ""),
             language=parsed.get("language_detected", "hinglish"),
             is_existing_customer=parsed.get("is_existing_customer", False),
