@@ -865,6 +865,16 @@ class ExotelVoiceConnectionManager:
 
             # LLM-based scoring (happens AFTER call, no customer-facing latency)
             llm_score = await score_lead_with_llm(transcript, self.bot_type)
+
+            # HOT must mean a real commitment. The scorer sometimes reads passive
+            # backchannels ("haan"/"boliye") as "agreed to meet" and marks HOT 8 with no
+            # appointment actually captured. scheduled_day is the authoritative signal —
+            # an [APPOINTMENT] tag was emitted only if it's set. Downgrade unsupported
+            # HOT to WARM so the pipeline isn't full of false hot leads.
+            if llm_score.get("category") == "HOT" and not (scheduled_day or scheduled_time):
+                llm_score["category"] = "WARM"
+                llm_score["score"] = min(int(llm_score.get("score", 7) or 7), 7)
+                logger.info("[Exotel] Downgraded HOT→WARM — no appointment was captured.")
             logger.info(f"[Exotel] LLM Score: {llm_score}")
 
             # Build LeadData with LLM results
